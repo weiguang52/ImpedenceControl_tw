@@ -36,6 +36,7 @@ import csv
 from collections import defaultdict
 from rclpy.node import Node
 from rdk_x5_multi_serial.msg import SerialData
+from impendence_control.admittance_calculate import JOINT_MOTOR_ROUTE
 
 # 尝试导入 matplotlib；若不可用则给出清晰提示
 try:
@@ -45,45 +46,6 @@ try:
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
-
-
-# 与 admittance_calculate.py 保持一致的映射表
-JOINT_MOTOR_ROUTE = {
-    'right_hip_roll':       {'serial_id': 1, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
-    'right_hip_yaw':        {'serial_id': 1, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
-    'right_knee_pitch':     {'serial_id': 1, 'board_id': 2, 'motor_index': 0, 'motor_count': 2},
-    'right_ankle_yaw':      {'serial_id': 1, 'board_id': 2, 'motor_index': 1, 'motor_count': 2},
-    'right_ankle_pitch':    {'serial_id': 1, 'board_id': 3, 'motor_index': 0, 'motor_count': 2},
-
-    'left_hip_pitch':       {'serial_id': 1, 'board_id': 0, 'motor_index': 0, 'motor_count': 3},
-    'right_hip_pitch':      {'serial_id': 1, 'board_id': 0, 'motor_index': 1, 'motor_count': 3},
-
-    'left_hip_roll':        {'serial_id': 3, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
-    'left_hip_yaw':         {'serial_id': 3, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
-    'left_knee_pitch':      {'serial_id': 3, 'board_id': 2, 'motor_index': 0, 'motor_count': 2},
-    'left_ankle_yaw':       {'serial_id': 3, 'board_id': 2, 'motor_index': 1, 'motor_count': 2},
-    'left_ankle_pitch':     {'serial_id': 3, 'board_id': 3, 'motor_index': 0, 'motor_count': 2},
-
-    'right_shoulder_pitch': {'serial_id': 4, 'board_id': 0, 'motor_index': 0, 'motor_count': 6},
-    'left_shoulder_pitch':  {'serial_id': 4, 'board_id': 0, 'motor_index': 1, 'motor_count': 6},
-    'right_shoulder_roll':  {'serial_id': 4, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
-    'right_shoulder_yaw':   {'serial_id': 4, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
-    'right_elbow_pitch':    {'serial_id': 4, 'board_id': 2, 'motor_index': 0, 'motor_count': 2},
-    'right_wrist_yaw':      {'serial_id': 4, 'board_id': 3, 'motor_index': 0, 'motor_count': 2},
-
-    'left_shoulder_roll':   {'serial_id': 6, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
-    'left_shoulder_yaw':    {'serial_id': 6, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
-    'left_elbow_pitch':     {'serial_id': 6, 'board_id': 2, 'motor_index': 0, 'motor_count': 2},
-    'left_wrist_yaw':       {'serial_id': 6, 'board_id': 3, 'motor_index': 0, 'motor_count': 2},
-
-    'neck_roll':            {'serial_id': 0, 'board_id': 7, 'motor_index': 0, 'motor_count': 2},
-    'neck_yaw':             {'serial_id': 2, 'board_id': 6, 'motor_index': 1, 'motor_count': 2},
-    'neck_pitch':           {'serial_id': 0, 'board_id': 7, 'motor_index': 1, 'motor_count': 2},
-
-    'waist_pitch':          {'serial_id': 4, 'board_id': 0, 'motor_index': 4, 'motor_count': 6},
-    'waist_roll':           {'serial_id': 4, 'board_id': 0, 'motor_index': 5, 'motor_count': 6},
-    'waist_yaw':            {'serial_id': 1, 'board_id': 0, 'motor_index': 2, 'motor_count': 3},
-}
 
 
 class CurrentMonitor(Node):

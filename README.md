@@ -39,7 +39,7 @@ source install/setup.bash
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=true \
-  -p debug_joint:="right_elbow_pitch"
+  -p debug_joint:="right_shoulder_roll"
 ```
 
 关闭导纳控制，仅验证轨迹和串口链路：
@@ -47,16 +47,16 @@ ros2 run impendence_control admittance_control --ros-args \
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=false \
-  -p debug_joint:="right_elbow_pitch"
+  -p debug_joint:="right_hip_pitch"
 ```
 
 ### 终端 2：启动轨迹规划节点
 
 ```bash
 ros2 run impendence_control trajectory_planner --ros-args \
-  -p joint_name:="right_elbow_pitch" \
-  -p start_pos:=0.0 \
-  -p end_pos:=90.0 \
+  -p joint_name:="right_hip_pitch" \
+  -p start_pos:=-20.0 \
+  -p end_pos:=70.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
   -p auto_start:=true
@@ -81,7 +81,7 @@ ros2 run impendence_control trajectory_planner --ros-args \
 ```bash
 ros2 run impendence_control current_monitor --ros-args \
   -p output_dir:="./current_plots" \
-  -p target_joints:="right_elbow_pitch"
+  -p target_joints:="right_hip_pitch"
 ```
 
 多关节监控：

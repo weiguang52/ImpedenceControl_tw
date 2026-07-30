@@ -277,8 +277,8 @@ JOINT_MOTOR_ROUTE: Dict[str, Dict[str, int]] = {
     'right_ankle_pitch':   {'serial_id': 1, 'board_id': 3, 'motor_index': 0, 'motor_count': 2},
     # serial 2
     # serial 3
-    'left_hip_pitch':      {'serial_id': 3, 'board_id': 0, 'motor_index': 0, 'motor_count': 3},
-    'right_hip_pitch':     {'serial_id': 3, 'board_id': 0, 'motor_index': 1, 'motor_count': 3},
+    'left_hip_pitch':      {'serial_id': 3, 'board_id': 0, 'motor_index': 1, 'motor_count': 3},
+    'right_hip_pitch':     {'serial_id': 3, 'board_id': 0, 'motor_index': 2, 'motor_count': 3},
     'left_hip_roll':       {'serial_id': 3, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
     'left_hip_yaw':        {'serial_id': 3, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
     'left_knee_pitch':     {'serial_id': 3, 'board_id': 2, 'motor_index': 0, 'motor_count': 2},
@@ -287,19 +287,19 @@ JOINT_MOTOR_ROUTE: Dict[str, Dict[str, int]] = {
     # serial 4
     'right_shoulder_pitch':{'serial_id': 4, 'board_id': 0, 'motor_index': 0, 'motor_count': 6},
     'left_shoulder_pitch': {'serial_id': 4, 'board_id': 0, 'motor_index': 1, 'motor_count': 6},
+    'neck_yaw':            {'serial_id': 4, 'board_id': 0, 'motor_index': 2, 'motor_count': 6},
+    'neck_roll':           {'serial_id': 4, 'board_id': 0, 'motor_index': 3, 'motor_count': 6},
     'right_shoulder_roll': {'serial_id': 4, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
     'right_shoulder_yaw':  {'serial_id': 4, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
     'right_elbow_pitch':   {'serial_id': 4, 'board_id': 2, 'motor_index': 0, 'motor_count': 2},
     'right_wrist_yaw':     {'serial_id': 4, 'board_id': 3, 'motor_index': 0, 'motor_count': 2},
     # serial 5
     # serial 6
-    'left_shoulder_roll':  {'serial_id': 6, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
-    'left_shoulder_yaw':   {'serial_id': 6, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
+    'left_shoulder_roll':  {'serial_id': 6, 'board_id': 1, 'motor_index': 0, 'motor_count': 2},
+    'left_shoulder_yaw':   {'serial_id': 6, 'board_id': 1, 'motor_index': 1, 'motor_count': 2},
     'left_elbow_pitch':    {'serial_id': 6, 'board_id': 2, 'motor_index': 0, 'motor_count': 2},
     'left_wrist_yaw':      {'serial_id': 6, 'board_id': 3, 'motor_index': 0, 'motor_count': 2},
     # serial 7
-    'neck_roll':           {'serial_id': 0, 'board_id': 7, 'motor_index': 0, 'motor_count': 2},
-    'neck_yaw':            {'serial_id': 2, 'board_id': 6, 'motor_index': 1, 'motor_count': 2},
     'neck_pitch':          {'serial_id': 0, 'board_id': 7, 'motor_index': 1, 'motor_count': 2},
     'waist_pitch':         {'serial_id': 4, 'board_id': 0, 'motor_index': 4, 'motor_count': 6},
     'waist_roll':          {'serial_id': 4, 'board_id': 0, 'motor_index': 5, 'motor_count': 6},
@@ -879,8 +879,8 @@ class AdmittanceControlNode(Node):
             'right_hip_pitch':      lambda x: x + whole_offset,
             'right_hip_roll':       lambda x: x + whole_offset,
             'right_hip_yaw':        lambda x: x + whole_offset,
-            'right_knee_pitch':     lambda x: - x,
-            'right_ankle_yaw':      lambda x: - x,
+            'right_knee_pitch':     lambda x: x,
+            'right_ankle_yaw':      lambda x: x,
             'right_ankle_pitch':    lambda x: x + whole_offset,
 
             # 右臂
