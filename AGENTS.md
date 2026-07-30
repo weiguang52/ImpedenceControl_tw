@@ -73,9 +73,11 @@ git push -u origin main
 
 - 初始化日期：`2026-07-29`
 - 初始化位置：`/home/sunrise/ImpendenceControl`
-- 首次提交：`e8392b9 feat: align RDK serial protocol and improve documentation`
+- 首次提交：`3a6b8f3 feat: align RDK serial protocol and improve documentation`
 - 首次推送：`main -> origin/main`
 - 仓库地址：<https://github.com/weiguang52/ImpedenceControl_tw>
+- 作者统一日期：`2026-07-30`
+- 统一作者：`weiguang52 <2386690965@qq.com>`
 
 以上记录用于说明仓库来源，不作为“最新提交”指针；后续应使用
 `git log -1 --oneline` 和 `git status --short --branch` 查看实时状态。
