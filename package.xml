@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypesets="g"?>
+<package format="3">
+  <name>impendence_control</name>
+  <version>0.1.0</version>
+  <description>机器人导纳控制包 - 上位机轨迹规划、导纳控制计算、电流监控</description>
+  <maintainer email="user@todo.todo">user</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <!-- rdk_x5_multi_serial 是自定义包，不需要 rosdep 安装
+       编译前确保已 source 或放在同一 workspace 下 -->
+  <!-- 订阅rdk_x5_multi_serial的/serial_data -->
+  <depend>rdk_x5_multi_serial</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
