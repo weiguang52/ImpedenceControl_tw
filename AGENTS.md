@@ -7,6 +7,8 @@
 - GitHub 仓库：<https://github.com/weiguang52/ImpedenceControl_tw>
 - Git remote：`origin`
 - 默认分支：`main`
+- Git 作者名称：`weiguang52`
+- Git 作者邮箱：`2386690965@qq.com`
 - RDK 最新协议来源：`/home/sunrise/git_demo/src/rdk_x5_multi_serial`
 
 ## 开发约束
@@ -45,6 +47,14 @@ ros2 topic info /serial_data -v
 ## 提交与推送
 
 - 尽量在 Linux 工作目录内执行 Git 操作，不在 Windows 本地副本中维护独立提交。
+- 本仓库的所有提交统一使用
+  `weiguang52 <2386690965@qq.com>` 作为 Author 和 Committer；提交前确认：
+
+```bash
+git config user.name "weiguang52"
+git config user.email "2386690965@qq.com"
+```
+
 - 提交前运行 `git status --short` 和上述构建检查。
 - 提交信息应直接描述变更，例如：
   `docs: improve debugging guide and record repository workflow`。
