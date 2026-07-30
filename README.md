@@ -98,6 +98,15 @@ ros2 run impendence_control current_monitor --ros-args \
 - `current_plot_<时间>.png`：全部活动关节的电流总览。
 - `current_<关节名>_<时间>.png`：单关节电流曲线。
 
+同时会在终端按“串口号 + 板号”打印 `/serial_data` 反馈条数：
+
+- `target_joints` 对应的串口/板号会标记为“预期”。
+- 预期路由一条反馈都没有时，会标记为“预期但未收到”。
+- 收到不属于当前 `target_joints` 的串口/板号数据时，会标记为“异常路由”。
+- `currents` 为空的反馈仍计入反馈总数，并单独显示空电流条数。
+- 未指定 `target_joints` 时，`JOINT_MOTOR_ROUTE` 中配置的全部路由均视为预期；
+  收到映射表之外的串口/板号仍会报告为异常。
+
 ## RDK 串口话题协议
 
 本项目按 `/home/sunrise/git_demo/src/rdk_x5_multi_serial` 的最新版协议收发：

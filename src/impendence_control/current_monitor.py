@@ -140,6 +140,25 @@ class CurrentMonitor(Node):
         self.frame_count = 0
         self.last_action_id = -1
         self.last_frame_index = -1
+        self.feedback_counts = defaultdict(int)
+        self.unexpected_feedback_counts = defaultdict(int)
+        self.empty_current_feedback_counts = defaultdict(int)
+        self.feedback_parse_error_count = 0
+
+        # 根据 target_joints 推导本次监控期望收到的 (串口号, 板号)。
+        # 未指定 target_joints 时，JOINT_MOTOR_ROUTE 中的全部路由均视为预期路由。
+        self.expected_route_joints = defaultdict(list)
+        for joint_name, route in JOINT_MOTOR_ROUTE.items():
+            if self.target_joints and joint_name not in self.target_joints:
+                continue
+
+            route_key = (
+                int(route['serial_id']),
+                int(route['board_id']),
+            )
+            self.expected_route_joints[route_key].append(joint_name)
+
+        self.expected_feedback_routes = set(self.expected_route_joints.keys())
 
         # 确保输出目录存在
         os.makedirs(self.output_dir, exist_ok=True)
@@ -162,6 +181,13 @@ class CurrentMonitor(Node):
         else:
             self.get_logger().info(f'  监控关节: 全部 ({len(JOINT_MOTOR_ROUTE)} 个)')
 
+        expected_routes_text = ', '.join(
+            f'串口 {serial_id}/板号 {board_id}'
+            for serial_id, board_id in sorted(self.expected_feedback_routes)
+        )
+        self.get_logger().info(
+            f'  预期反馈路由: {expected_routes_text or "无有效路由"}'
+        )
         self.get_logger().info('  CSV 保存方式: 停止时保存一次')
         self.get_logger().info('  图像导出方式: 停止时导出')
         self.get_logger().info('=' * 60)
@@ -173,11 +199,22 @@ class CurrentMonitor(Node):
         try:
             serial_id = int(msg.port)
             board_id = int(msg.board_id)
+            route_key = (serial_id, board_id)
+
+            # 反馈条数按 /serial_data 消息计数，即使 currents 为空也计入。
+            self.feedback_counts[route_key] += 1
+            self.frame_count += 1
+            if route_key not in self.expected_feedback_routes:
+                self.unexpected_feedback_counts[route_key] += 1
+
             currents = [float(x) for x in msg.currents]
             action_id = int(msg.action_id)
             frame_index = int(msg.frame_index)
+            self.last_action_id = action_id
+            self.last_frame_index = frame_index
 
             if not currents:
+                self.empty_current_feedback_counts[route_key] += 1
                 return
 
             now = time.time()
@@ -200,11 +237,8 @@ class CurrentMonitor(Node):
                 current_val = currents[motor_index]
                 self.data[joint_name].append((now, current_val))
 
-            self.frame_count += 1
-            self.last_action_id = action_id
-            self.last_frame_index = frame_index
-
         except Exception as e:
+            self.feedback_parse_error_count += 1
             self.get_logger().error(f'处理反馈数据失败: {e}')
 
     # ==================== CSV 导出 ====================
@@ -459,6 +493,68 @@ class CurrentMonitor(Node):
 
     # ==================== 生命周期 ====================
 
+    def print_feedback_summary(self):
+        """按串口号和板号打印本次运行收到的 /serial_data 反馈统计。"""
+        total_feedback = sum(self.feedback_counts.values())
+        unexpected_total = sum(self.unexpected_feedback_counts.values())
+        all_routes = (
+            self.expected_feedback_routes
+            | set(self.feedback_counts.keys())
+        )
+
+        self.get_logger().info('=' * 70)
+        self.get_logger().info(
+            f'📡 /serial_data 反馈统计: 共收到 {total_feedback} 条，'
+            f'涉及 {len(self.feedback_counts)} 个串口/板号组合'
+        )
+
+        if not all_routes:
+            self.get_logger().warning('⚠️  当前没有有效的预期路由，也没有收到可识别的反馈')
+
+        for serial_id, board_id in sorted(all_routes):
+            route_key = (serial_id, board_id)
+            count = self.feedback_counts.get(route_key, 0)
+            empty_count = self.empty_current_feedback_counts.get(route_key, 0)
+            expected_joints = self.expected_route_joints.get(route_key, [])
+
+            if route_key in self.expected_feedback_routes:
+                if count > 0:
+                    status = '✅ 预期'
+                else:
+                    status = '⚠️ 预期但未收到'
+
+                joints_text = ', '.join(expected_joints)
+                route_detail = f'，关节: {joints_text}' if joints_text else ''
+            else:
+                status = '❌ 异常路由'
+                route_detail = '，不属于本次 target_joints 的预期反馈'
+
+            empty_detail = (
+                f'，其中 currents 为空 {empty_count} 条'
+                if empty_count
+                else ''
+            )
+            self.get_logger().info(
+                f'  {status} | 串口 {serial_id} | 板号 {board_id} | '
+                f'{count} 条{empty_detail}{route_detail}'
+            )
+
+        if unexpected_total:
+            self.get_logger().warning(
+                f'❌ 检测到异常串口/板号反馈共 {unexpected_total} 条，'
+                '请检查 RDK 发布范围、串口映射和 target_joints 配置'
+            )
+        else:
+            self.get_logger().info('✅ 未检测到异常串口/板号反馈')
+
+        if self.feedback_parse_error_count:
+            self.get_logger().warning(
+                f'⚠️  另有 {self.feedback_parse_error_count} 条反馈解析失败，'
+                '未能完整归入上述统计'
+            )
+
+        self.get_logger().info('=' * 70)
+
     def shutdown(self):
         """关闭节点时的清理工作：保存 CSV + 导出图像。"""
         self.get_logger().info('🔻 正在关闭电流监控节点...')
@@ -467,6 +563,7 @@ class CurrentMonitor(Node):
         self.get_logger().info(
             f'📊 共采集 {self.frame_count} 帧反馈, {total_points} 个电流数据点'
         )
+        self.print_feedback_summary()
 
         # 停止时保存一次 CSV
         self.save_csv()
