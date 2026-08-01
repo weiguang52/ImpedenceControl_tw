@@ -5,245 +5,276 @@ from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional, Any, List
 import math  
 from rclpy.node import Node
+from impendence_control.torque_model import current_to_torque
 
 CURRENT_MA_TO_A = 0.001
 RDK_ACTION_ID = 1
 
 # ========== 关节参数配置表（在这里定义所有关节的参数） ==========
+# 每个关节的电流—力矩模型：
+#   torque (N·m) = torque_slope_nm_per_a * current (A) + torque_intercept_nm
+# 斜率和截距必须使用该关节所连接电机的独立标定结果。
 JOINT_CONFIGS = {
-    '''
-    'joint': {
-        'current_threshold': 0.03,              # 电流突变阈值 (A)
-        'current_recovery_threshold': 0.015,    # 电流恢复阈值 (A)
-        'current_to_torque_coeff': 1.2,        # 电流到力矩转换系数
-        'expected_torque': 0.1,                 # 期望力矩 (N·m)
-        'damping_coeff': 15.0,                  # 阻尼系数 (B)
-        'stiffness_coeff': 120.0,               # 刚度系数 (K)
-    },
-    '''
     'right_shoulder_roll': {
         'current_threshold': 0.04,              # 电流突变阈值 (A)
         'current_recovery_threshold': 0.02,    # 电流恢复阈值 (A)
-        'current_to_torque_coeff': 0.8,        # 电流到力矩转换系数
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,                 # 期望力矩 (N·m)
         'damping_coeff': 0.0001,                  # 阻尼系数 (B)
         'stiffness_coeff': 0.07,               # 刚度系数 (K)
-    },#
+    },# 垂直轴
     'right_shoulder_yaw': {
         'current_threshold': 0.02,
         'current_recovery_threshold': 0.01,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'right_elbow_pitch': {
         'current_threshold': 0.2,
         'current_recovery_threshold': 0.1,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.04,
-    },#
+    },# 垂直轴
     'right_wrist_yaw': {
         'current_threshold': 0.035,
         'current_recovery_threshold': 0.0175,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'left_shoulder_roll': {
         'current_threshold': 0.04,
         'current_recovery_threshold': 0.02,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'left_shoulder_yaw': {
         'current_threshold': 0.02,
         'current_recovery_threshold': 0.01,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'left_elbow_pitch': {
         'current_threshold': 0.02,
         'current_recovery_threshold': 0.01,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 20.0,
         'stiffness_coeff': 200.0,
-    },#
+    },# 垂直轴
     'left_wrist_yaw': {
         'current_threshold': 0.035,
         'current_recovery_threshold': 0.0175,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'right_shoulder_pitch': {
         'current_threshold': 0.02,
         'current_recovery_threshold': 0.01,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'left_shoulder_pitch': {
         'current_threshold': 0.02,
         'current_recovery_threshold': 0.01,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'neck_roll': {
         'current_threshold': 0.025,
         'current_recovery_threshold': 0.012,
-        'current_to_torque_coeff': 1.0,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.08,
         'damping_coeff': 12.0,
         'stiffness_coeff': 100.0,
-    },
+    },# 垂直轴
     'neck_yaw': {
         'current_threshold': 0.04,
         'current_recovery_threshold': 0.02,
-        'current_to_torque_coeff': 1.5,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.15,
         'damping_coeff': 20.0,
         'stiffness_coeff': 150.0,
-    },
+    },# 同轴
+    'neck_pitch': {
+        'current_threshold': 0.02,
+        'current_recovery_threshold': 0.01,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
+        'expected_torque': 0.0,
+        'damping_coeff': 10.0,
+        'stiffness_coeff': 100.0,
+    },# 垂直轴
     'waist_pitch': {
         'current_threshold': 0.022,
         'current_recovery_threshold': 0.011,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.05,
         'damping_coeff': 10.0,
         'stiffness_coeff': 90.0,
-    },
+    },# 垂直轴
     'waist_roll': {
         'current_threshold': 0.025,
         'current_recovery_threshold': 0.012,
-        'current_to_torque_coeff': 1.0,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.08,
         'damping_coeff': 12.0,
         'stiffness_coeff': 100.0,
-    },
+    },# 垂直轴
     'right_hip_pitch': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.005,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },
+    },# 垂直轴
     'left_hip_pitch': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.005,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },
+    },# 垂直轴
     'waist_yaw': {
         'current_threshold': 0.025,
         'current_recovery_threshold': 0.012,
-        'current_to_torque_coeff': 1.0,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.08,
         'damping_coeff': 12.0,
         'stiffness_coeff': 100.0,
-    },
+    },# 同轴
     'right_hip_roll': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.04,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'right_hip_yaw': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.03,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'right_knee_pitch': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.04,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'right_ankle_yaw': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.02,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'right_ankle_pitch': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.025,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'left_hip_roll': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.04,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'left_hip_yaw': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.03,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'left_knee_pitch': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.04,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
     'left_ankle_yaw': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.02,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.328629,
+        'torque_intercept_nm': -0.022189,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 同轴
     'left_ankle_pitch': {
         'current_threshold': 2,
         'current_recovery_threshold': 0.025,
-        'current_to_torque_coeff': 0.8,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
         'stiffness_coeff': 0.07,
-    },#
+    },# 垂直轴
 }
 
 # 默认配置（如果某个关节没有在上面定义）
 DEFAULT_CONFIG = {
     'current_threshold': 0.02,
     'current_recovery_threshold': 0.01,
-    'current_to_torque_coeff': 1.0,
+    'torque_slope_nm_per_a': 1.328629,
+    'torque_intercept_nm': -0.022189,
     'expected_torque': 0.0,
     'damping_coeff': 10.0,
     'stiffness_coeff': 100.0,
@@ -338,6 +369,8 @@ class MotorAdmittanceState:
     """单个电机的导纳控制状态"""
     joint_id: str = ""
     current_current: float = 0.0
+    measured_torque: float = 0.0
+    torque_error: float = 0.0
     current_position: float = 0.0
     last_current: float = 0.0
     last_position: float = 0.0
@@ -410,9 +443,13 @@ class JointAdmittanceController(Node):
         # 碰撞检测
         collision_detected = self._detect_collision(state, config)
         
-        # 计算力矩差
-        measured_torque = state.current_current * config['current_to_torque_coeff']
-        torque_difference = measured_torque - config['expected_torque']
+        # 使用当前关节自己的标定参数，将电流 (A) 转换为力矩 (N·m)。
+        state.measured_torque = current_to_torque(
+            state.current_current,
+            config['torque_slope_nm_per_a'],
+            config['torque_intercept_nm'],
+        )
+        state.torque_error = state.measured_torque - config['expected_torque']
         
         # 计算速度差
         current_time = time.time()
@@ -423,12 +460,28 @@ class JointAdmittanceController(Node):
         velocity_difference = velocity - state.last_velocity
         
         # 导纳方程求解位置调整量
-        position_diff = (torque_difference - config['damping_coeff'] * velocity_difference) / config['stiffness_coeff']
+        stiffness = config['stiffness_coeff']
+        if abs(stiffness) < 1e-12:
+            self.get_logger().error(
+                f'关节 {joint_id} 的 stiffness_coeff 不能为 0，跳过本次导纳调整'
+            )
+            return collision_detected, state.planned_position
+
+        position_diff = (
+            state.torque_error
+            - config['damping_coeff'] * velocity_difference
+        ) / stiffness
         
         # 限幅
         max_adj = COMMON_PARAMS['max_position_adjustment']
         position_diff = max(min(position_diff, max_adj), -max_adj)
-        self.get_logger().info(f'collision_detected:  {collision_detected}  position_diff:  {position_diff}')
+        self.get_logger().info(
+            f'collision_detected: {collision_detected}  '
+            f'current: {state.current_current:.6f} A  '
+            f'measured_torque: {state.measured_torque:.6f} N·m  '
+            f'torque_error: {state.torque_error:.6f} N·m  '
+            f'position_diff: {position_diff}'
+        )
         
         # 更新目标位置
         state.target_position = state.planned_position + position_diff
@@ -495,6 +548,9 @@ class JointAdmittanceController(Node):
         return f"""
 ========== 关节 {joint_id} 诊断信息 ==========
 当前电流: {state.current_current:.4f} A
+标定力矩: {state.measured_torque:.6f} N·m
+期望力矩: {config['expected_torque']:.6f} N·m
+力矩误差: {state.torque_error:.6f} N·m
 当前位置: {state.current_position:.2f}°
 基准电流: {state.baseline_current:.4f} A
 电流偏差: {abs(state.current_current - state.baseline_current):.4f} A
@@ -509,6 +565,7 @@ class JointAdmittanceController(Node):
   - 阻尼系数: {config['damping_coeff']}
   - 刚度系数: {config['stiffness_coeff']}
   - 电流阈值: {config['current_threshold']}A
+  - 电流—力矩模型: torque = {config['torque_slope_nm_per_a']} * current {config['torque_intercept_nm']:+} N·m
 ===============================================
 """
     

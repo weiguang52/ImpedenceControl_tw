@@ -47,16 +47,16 @@ ros2 run impendence_control admittance_control --ros-args \
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=false \
-  -p debug_joint:="right_hip_pitch"
+  -p debug_joint:="right_shoulder_pitch"
 ```
 
 ### 终端 2：启动轨迹规划节点
 
 ```bash
 ros2 run impendence_control trajectory_planner --ros-args \
-  -p joint_name:="right_hip_pitch" \
-  -p start_pos:=-20.0 \
-  -p end_pos:=70.0 \
+  -p joint_name:="right_shoulder_pitch" \
+  -p start_pos:=0.0 \
+  -p end_pos:=90.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
   -p auto_start:=true
@@ -81,7 +81,7 @@ ros2 run impendence_control trajectory_planner --ros-args \
 ```bash
 ros2 run impendence_control current_monitor --ros-args \
   -p output_dir:="./current_plots" \
-  -p target_joints:="right_hip_pitch"
+  -p target_joints:="right_shoulder_pitch"
 ```
 
 多关节监控：
@@ -178,6 +178,35 @@ trajectory_planner
 | `enable_motor_angle_debug` | 是否发布并打印电机角映射 | `true` |
 | `motor_angle_debug_interval` | 每隔多少帧输出一次角度调试信息 | `30` |
 | `motor_angle_debug_topic` | 电机角调试话题 | `/motor_angle_debug` |
+
+### 电流—力矩标定模型
+
+每个关节都在 `admittance_calculate.py` 的 `JOINT_CONFIGS` 中单独配置线性标定模型：
+
+```text
+力矩 (N·m) = torque_slope_nm_per_a × 电流 (A) + torque_intercept_nm
+```
+
+- `/serial_data.currents` 的原始值按 mA 接收，进入控制器前乘以 `0.001`
+  转换为 A，再代入标定模型。
+- `torque_slope_nm_per_a` 是当前关节的标定斜率，单位为 N·m/A。
+- `torque_intercept_nm` 是当前关节的标定截距，单位为 N·m。
+- 每个关节必须分别填写自己的标定结果；控制器会根据 `joint_id` 读取对应参数。
+- `expected_torque` 仍是每个关节的期望力矩，单位为 N·m。
+- `current_threshold` 和 `current_recovery_threshold` 仍用于基于电流偏差的
+  碰撞检测，单位为 A；原有各关节阈值保持不变。
+- `damping_coeff`、`stiffness_coeff` 仍是各关节独立的导纳参数。本次只替换
+  标定模型，不凭电流标定结果推测新的阻尼和刚度。
+- 当 `stiffness_coeff` 为 `0` 时，本次控制会跳过位置调整并输出错误日志，
+  避免除零产生异常命令。
+
+当前 `JOINT_CONFIGS` 中的标定参数分组如下。这里仅用于调试核对，运行时始终以
+源码中的每关节配置为准：
+
+| 斜率（N·m/A） | 截距（N·m） | 关节 |
+| ---: | ---: | --- |
+| `1.182535` | `-0.025172` | `right_elbow_pitch`、`left_shoulder_roll`、`left_elbow_pitch`、`right_shoulder_pitch`、`neck_pitch`、`right_hip_roll`、`right_knee_pitch`、`right_ankle_pitch`、`left_knee_pitch`、`left_ankle_pitch` |
+| `1.328629` | `-0.022189` | `right_shoulder_roll`、`right_shoulder_yaw`、`right_wrist_yaw`、`left_shoulder_yaw`、`left_wrist_yaw`、`left_shoulder_pitch`、`neck_roll`、`neck_yaw`、`waist_pitch`、`waist_roll`、`right_hip_pitch`、`left_hip_pitch`、`waist_yaw`、`right_hip_yaw`、`right_ankle_yaw`、`left_hip_roll`、`left_hip_yaw`、`left_ankle_yaw` |
 
 电流监控参数：
 
