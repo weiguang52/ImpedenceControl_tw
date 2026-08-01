@@ -25,7 +25,7 @@
 
 输出：
   - 总览 PNG 图像: <output_dir>/current_plot_<timestamp>.png
-  - 单关节 PNG 图像: <output_dir>/current_<joint_name>_<timestamp>.png
+  - 电流偏差 PNG 图像: <output_dir>/current_deviation_<timestamp>.png
   - CSV 数据: <output_dir>/current_data_<timestamp>.csv
 """
 
@@ -33,10 +33,15 @@ import rclpy
 import time
 import os
 import csv
+import math
 from collections import defaultdict
 from rclpy.node import Node
 from rdk_x5_multi_serial.msg import SerialData
-from impendence_control.admittance_calculate import JOINT_MOTOR_ROUTE
+from impendence_control.admittance_calculate import (
+    COMMON_PARAMS,
+    JOINT_CONFIGS,
+    JOINT_MOTOR_ROUTE,
+)
 
 # 尝试导入 matplotlib；若不可用则给出清晰提示
 try:
@@ -102,6 +107,14 @@ class CurrentMonitor(Node):
         self.frame_count = 0
         self.last_action_id = -1
         self.last_frame_index = -1
+        self.current_average_window = max(
+            1,
+            int(COMMON_PARAMS['filter_window_size']),
+        )
+        self.baseline_update_interval = max(
+            1,
+            int(COMMON_PARAMS['baseline_update_interval']),
+        )
         self.feedback_counts = defaultdict(int)
         self.unexpected_feedback_counts = defaultdict(int)
         self.empty_current_feedback_counts = defaultdict(int)
@@ -149,6 +162,12 @@ class CurrentMonitor(Node):
         )
         self.get_logger().info(
             f'  预期反馈路由: {expected_routes_text or "无有效路由"}'
+        )
+        self.get_logger().info(
+            f'  电流窗口平均: {self.current_average_window} 点'
+        )
+        self.get_logger().info(
+            f'  基线更新间隔: {self.baseline_update_interval} 点'
         )
         self.get_logger().info('  CSV 保存方式: 停止时保存一次')
         self.get_logger().info('  图像导出方式: 停止时导出')
@@ -252,6 +271,86 @@ class CurrentMonitor(Node):
 
     # ==================== 绘图 ====================
 
+    @staticmethod
+    def _moving_average(values: list, window_size: int) -> list:
+        """计算与 CurrentFilter 一致的滑动窗口平均，返回等长序列。"""
+        if not values:
+            return []
+
+        window_size = max(1, int(window_size))
+        moving_average = []
+        running_sum = 0.0
+
+        for index, value in enumerate(values):
+            running_sum += float(value)
+            if index >= window_size:
+                running_sum -= float(values[index - window_size])
+
+            sample_count = min(index + 1, window_size)
+            moving_average.append(running_sum / sample_count)
+
+        return moving_average
+
+    @staticmethod
+    def _baseline_series(window_currents: list, update_interval: int) -> list:
+        """按照导纳控制器的更新间隔重建阶梯状基线电流序列。"""
+        update_interval = max(1, int(update_interval))
+        baseline_currents = []
+        baseline_current = 0.0
+
+        for sample_index, window_current in enumerate(window_currents, start=1):
+            if sample_index % update_interval == 0:
+                baseline_current = float(window_current)
+            baseline_currents.append(baseline_current)
+
+        return baseline_currents
+
+    @staticmethod
+    def _admittance_enabled_series(
+        deviations: list,
+        collision_threshold: float,
+        recovery_threshold: float,
+        collision_confirm_count: int,
+        recovery_confirm_count: int,
+    ) -> list:
+        """按照碰撞/恢复确认逻辑重建导纳是否启用的布尔序列。"""
+        collision_confirm_count = max(1, int(collision_confirm_count))
+        recovery_confirm_count = max(1, int(recovery_confirm_count))
+        enabled = False
+        collision_counter = 0
+        recovery_counter = 0
+        enabled_series = []
+
+        for deviation in deviations:
+            if math.isnan(deviation):
+                enabled = False
+                collision_counter = 0
+                recovery_counter = 0
+                enabled_series.append(0)
+                continue
+
+            if enabled:
+                if deviation < recovery_threshold:
+                    recovery_counter += 1
+                    if recovery_counter >= recovery_confirm_count:
+                        enabled = False
+                        collision_counter = 0
+                        recovery_counter = 0
+                else:
+                    recovery_counter = 0
+            else:
+                if deviation > collision_threshold:
+                    collision_counter += 1
+                    if collision_counter >= collision_confirm_count:
+                        enabled = True
+                        recovery_counter = 0
+                else:
+                    collision_counter = 0
+
+            enabled_series.append(1 if enabled else 0)
+
+        return enabled_series
+
     def plot_current_curves(self, save: bool = True, show: bool = False):
         """
         绘制所有已记录关节的时间-电流曲线。
@@ -309,13 +408,40 @@ class CurrentMonitor(Node):
 
             times = [t - self.start_time for t, _ in records]
             currents = [c for _, c in records]
+            window_currents = self._moving_average(
+                currents,
+                self.current_average_window,
+            )
+            baseline_currents = self._baseline_series(
+                window_currents,
+                self.baseline_update_interval,
+            )
 
             ax.plot(
                 times,
                 currents,
                 linewidth=0.8,
                 color='#2196F3',
-                alpha=0.9
+                alpha=0.35,
+                label='Raw current',
+            )
+            ax.plot(
+                times,
+                window_currents,
+                linewidth=1.4,
+                color='#FF9800',
+                alpha=0.95,
+                label=f'Window mean (N={self.current_average_window})',
+            )
+            ax.plot(
+                times,
+                baseline_currents,
+                linewidth=1.2,
+                color='#4CAF50',
+                linestyle='--',
+                drawstyle='steps-post',
+                alpha=0.95,
+                label=f'Baseline (K={self.baseline_update_interval})',
             )
 
             ax.set_title(joint_name, fontsize=10, fontweight='bold')
@@ -327,22 +453,15 @@ class CurrentMonitor(Node):
             max_c = max(currents) if currents else 0
             min_c = min(currents) if currents else 0
 
-            ax.axhline(
-                y=mean_c,
-                color='red',
-                linestyle='--',
-                linewidth=0.6,
-                alpha=0.6,
-                label=f'Mean: {mean_c:.4f}mA'
-            )
-
             ax.legend(fontsize=7, loc='upper right')
 
             stats_text = (
                 f'Points: {len(records)}\n'
                 f'Max: {max_c:.4f}mA\n'
                 f'Min: {min_c:.4f}mA\n'
-                f'Mean: {mean_c:.4f}mA'
+                f'Mean: {mean_c:.4f}mA\n'
+                f'Last window mean: {window_currents[-1]:.4f}mA\n'
+                f'Last baseline: {baseline_currents[-1]:.4f}mA'
             )
 
             ax.text(
@@ -374,84 +493,166 @@ class CurrentMonitor(Node):
             fig.savefig(filepath, dpi=150, bbox_inches='tight')
 
             self.get_logger().info(f'💾 电流曲线总图已保存: {filepath}')
-
-            # 同时为每个有数据的关节单独保存一张图
-            for joint_name, records in active_joints.items():
-                self._plot_single_joint(joint_name, records, timestamp)
+            self._plot_current_deviations(active_joints, timestamp)
 
         if show:
             plt.show()
 
         plt.close(fig)
 
-    def _plot_single_joint(self, joint_name: str, records: list, timestamp: str):
-        """为单个关节绘制单独的大图。"""
-        fig, ax = plt.subplots(figsize=(12, 5))
-
-        times = [t - self.start_time for t, _ in records]
-        currents = [c for _, c in records]
-
-        ax.plot(times, currents, linewidth=1.0, color='#2196F3')
-        ax.fill_between(times, currents, alpha=0.15, color='#2196F3')
-
-        mean_c = sum(currents) / len(currents) if currents else 0
-        max_c = max(currents) if currents else 0
-        min_c = min(currents) if currents else 0
-
-        ax.axhline(
-            y=mean_c,
-            color='red',
-            linestyle='--',
-            linewidth=0.8,
-            alpha=0.7,
-            label=f'Mean: {mean_c:.4f} mA'
+    def _plot_current_deviations(
+        self,
+        active_joints: dict,
+        timestamp: str,
+    ):
+        """绘制首次基线建立后的 |实际电流 - 基线电流| 总览图。"""
+        n_joints = len(active_joints)
+        n_cols = min(3, n_joints)
+        n_rows = (n_joints + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(
+            n_rows,
+            n_cols,
+            figsize=(6 * n_cols, 4 * n_rows),
+        )
+        fig.suptitle(
+            f'Current Deviation from Baseline\n'
+            f'(Recorded: {time.strftime("%Y-%m-%d %H:%M:%S")})',
+            fontsize=14,
+            fontweight='bold',
         )
 
-        ax.set_title(
-            f'{joint_name} - Current vs Time',
-            fontsize=13,
-            fontweight='bold'
-        )
+        if n_joints == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten() if hasattr(axes, 'flatten') else axes
 
-        ax.set_xlabel('Time (s)', fontsize=11)
-        ax.set_ylabel('Current (mA)', fontsize=11)
-        ax.grid(True, alpha=0.3, linestyle='--')
-        ax.legend(fontsize=9)
-
-        stats_text = (
-            f'Samples: {len(records)} | '
-            f'Max: {max_c:.4f}mA | '
-            f'Min: {min_c:.4f}mA | '
-            f'Mean: {mean_c:.4f}mA'
-        )
-
-        ax.text(
-            0.5,
-            -0.12,
-            stats_text,
-            transform=ax.transAxes,
-            fontsize=9,
-            ha='center',
-            va='top',
-            bbox=dict(
-                boxstyle='round',
-                facecolor='lightgray',
-                alpha=0.7
+        for idx, (joint_name, records) in enumerate(sorted(active_joints.items())):
+            ax = axes[idx]
+            times = [t - self.start_time for t, _ in records]
+            currents = [c for _, c in records]
+            window_currents = self._moving_average(
+                currents,
+                self.current_average_window,
             )
-        )
+            baseline_currents = self._baseline_series(
+                window_currents,
+                self.baseline_update_interval,
+            )
+            deviations = [
+                (
+                    abs(current - baseline)
+                    if sample_index >= self.baseline_update_interval
+                    else float('nan')
+                )
+                for sample_index, (current, baseline) in enumerate(
+                    zip(currents, baseline_currents),
+                    start=1,
+                )
+            ]
+
+            ax.plot(
+                times,
+                deviations,
+                linewidth=1.2,
+                color='#9C27B0',
+                label='|Raw current - baseline|',
+            )
+
+            config = JOINT_CONFIGS.get(joint_name)
+            if config is not None:
+                threshold_ma = float(config['current_threshold']) * 1000.0
+                ax.axhline(
+                    y=threshold_ma,
+                    color='#F44336',
+                    linestyle='--',
+                    linewidth=1.0,
+                    label=f'Collision threshold: {threshold_ma:.4f}mA',
+                )
+                recovery_threshold_ma = (
+                    float(config['current_recovery_threshold']) * 1000.0
+                )
+                ax.axhline(
+                    y=recovery_threshold_ma,
+                    color='#00BCD4',
+                    linestyle='-.',
+                    linewidth=1.0,
+                    label=(
+                        f'Recovery threshold: '
+                        f'{recovery_threshold_ma:.4f}mA'
+                    ),
+                )
+                admittance_enabled = self._admittance_enabled_series(
+                    deviations,
+                    threshold_ma,
+                    recovery_threshold_ma,
+                    COMMON_PARAMS['collision_confirm_threshold'],
+                    COMMON_PARAMS['recovery_confirm_threshold'],
+                )
+
+                state_ax = ax.twinx()
+                state_ax.step(
+                    times,
+                    admittance_enabled,
+                    where='post',
+                    linewidth=1.2,
+                    color='#795548',
+                    label='Admittance active',
+                )
+                state_ax.set_ylabel(
+                    'Admittance state',
+                    color='#795548',
+                )
+                state_ax.tick_params(axis='y', labelcolor='#795548')
+                state_ax.set_ylim(-0.05, 1.05)
+                state_ax.set_yticks([0, 1])
+                state_ax.set_yticklabels(['Disabled', 'Enabled'])
+            else:
+                state_ax = None
+
+            if len(times) >= self.baseline_update_interval:
+                baseline_ready_time = times[self.baseline_update_interval - 1]
+                ax.axvline(
+                    x=baseline_ready_time,
+                    color='#4CAF50',
+                    linestyle=':',
+                    linewidth=1.0,
+                    label='First baseline ready',
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    'Waiting for first baseline',
+                    transform=ax.transAxes,
+                    ha='center',
+                    va='center',
+                    fontsize=9,
+                )
+
+            ax.set_title(joint_name, fontsize=10, fontweight='bold')
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Absolute current deviation (mA)')
+            ax.grid(True, alpha=0.3, linestyle='--')
+            lines, labels = ax.get_legend_handles_labels()
+            if state_ax is not None:
+                state_lines, state_labels = (
+                    state_ax.get_legend_handles_labels()
+                )
+                lines += state_lines
+                labels += state_labels
+            ax.legend(lines, labels, fontsize=7, loc='upper right')
+
+        for idx in range(n_joints, len(axes)):
+            axes[idx].set_visible(False)
 
         fig.tight_layout()
-
-        safe_name = joint_name.replace('/', '_')
         filepath = os.path.join(
             self.output_dir,
-            f'current_{safe_name}_{timestamp}.png'
+            f'current_deviation_{timestamp}.png',
         )
-
         fig.savefig(filepath, dpi=150, bbox_inches='tight')
         plt.close(fig)
-
-        self.get_logger().info(f'💾 单关节图已保存: {filepath}')
+        self.get_logger().info(f'💾 电流偏差总图已保存: {filepath}')
 
     # ==================== 生命周期 ====================
 

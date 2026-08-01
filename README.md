@@ -39,7 +39,7 @@ source install/setup.bash
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=true \
-  -p debug_joint:="right_shoulder_roll"
+  -p debug_joint:="left_shoulder_roll"
 ```
 
 关闭导纳控制，仅验证轨迹和串口链路：
@@ -47,16 +47,24 @@ ros2 run impendence_control admittance_control --ros-args \
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=false \
-  -p debug_joint:="right_shoulder_pitch"
+  -p debug_joint:="left_shoulder_roll"
 ```
 
 ### 终端 2：启动轨迹规划节点
 
 ```bash
 ros2 run impendence_control trajectory_planner --ros-args \
-  -p joint_name:="right_shoulder_pitch" \
-  -p start_pos:=0.0 \
-  -p end_pos:=90.0 \
+  -p joint_name:="left_shoulder_roll" \
+  -p start_pos:=200.0 \
+  -p end_pos:=290.0 \
+  -p duration:=8.0 \
+  -p frequency:=90.0 \
+  -p auto_start:=true
+
+ros2 run impendence_control trajectory_planner --ros-args \
+  -p joint_name:="left_shoulder_roll" \
+  -p start_pos:=290.0 \
+  -p end_pos:=200.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
   -p auto_start:=true
@@ -81,7 +89,7 @@ ros2 run impendence_control trajectory_planner --ros-args \
 ```bash
 ros2 run impendence_control current_monitor --ros-args \
   -p output_dir:="./current_plots" \
-  -p target_joints:="right_shoulder_pitch"
+  -p target_joints:="left_shoulder_roll"
 ```
 
 多关节监控：
@@ -95,8 +103,25 @@ ros2 run impendence_control current_monitor --ros-args \
 停止节点时会在 `output_dir` 中生成：
 
 - `current_data_<时间>.csv`：时间、电流和关节名称。
-- `current_plot_<时间>.png`：全部活动关节的电流总览。
-- `current_<关节名>_<时间>.png`：单关节电流曲线。
+- `current_plot_<时间>.png`：全部活动关节的电流总览，同时绘制原始电流、
+  滑动窗口平均电流和基线电流。
+- `current_deviation_<时间>.png`：全部活动关节的电流偏差总览，绘制首次基线
+  建立后的 `|实际电流 - 基线电流|`，并标出各关节的碰撞阈值与恢复阈值。
+  每个子图右侧纵轴显示导纳状态：`0 / Disabled` 表示未启动，
+  `1 / Enabled` 表示已启动。
+
+右轴状态按照控制器相同的逻辑重建：首次基线建立前保持关闭；电流偏差连续达到
+`collision_confirm_threshold` 次超过碰撞阈值后变为开启；连续达到
+`recovery_confirm_threshold` 次低于恢复阈值后恢复为关闭。
+
+不再按关节名称分别输出单关节 PNG；两个 PNG 都使用多子图总览方式。
+
+图中的蓝线为原始电流，橙线为窗口平均电流，绿色虚线阶梯为基线电流；不再绘制
+全部样本的总体平均线。
+窗口长度直接复用导纳控制 `COMMON_PARAMS['filter_window_size']`，当前默认是
+`20` 点；因此修改导纳滤波窗口后，电流监控输出图会自动使用相同窗口。窗口尚未
+填满时，平均值使用当前已有的全部样本计算。基线初始为 `0 mA`，每累计
+`COMMON_PARAMS['baseline_update_interval']` 个样本后更新为当时的窗口平均值。
 
 同时会在终端按“串口号 + 板号”打印 `/serial_data` 反馈条数：
 
@@ -234,14 +259,16 @@ trajectory_planner
 ```
 
 默认窗口为 `20` 个样本。每个关节累计执行
-`baseline_update_interval = 100` 次控制后，才将当前窗口平均值写入
+`baseline_update_interval = 5` 次控制后，才将当前窗口平均值写入
 `baseline_current`，随后计数器清零。
 
 > [!IMPORTANT]
-> 当前实现中，关节初始化时 `baseline_current = 0 A`。第一次累计到 100 个样本
-> 之前，碰撞检测使用的仍是零基准；基准更新也没有因碰撞状态而暂停。
-> 在 90 Hz 且该关节每帧均执行的情况下，20 个样本约为 `0.22 s`，
-> 100 个样本约为 `1.11 s`。实际时间会随命令频率和该关节是否参与当前命令变化。
+> 当前实现中，关节初始化时 `baseline_current = 0 A`。第一次累计到 5 个样本
+> 之前不会执行电流偏差阈值判断，也不会进入碰撞状态；首次基线建立后才启用
+> 碰撞与恢复判断。出现疑似碰撞或进入碰撞状态后，会冻结基线滤波窗口和基线
+> 电流，异常电流不会参与后续基线计算；恢复后才重新采集正常电流并继续更新。
+> 在 90 Hz 且该关节每帧均执行的情况下，5 个样本约为 `0.06 s`。实际时间会
+> 随命令频率和该关节是否参与当前命令变化。
 
 #### 碰撞检测与恢复
 
@@ -325,9 +352,9 @@ target_position = planned_position + position_diff
 
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
-| `collision_confirm_threshold` | `2` | 连续多少次超过电流阈值才确认碰撞 |
+| `collision_confirm_threshold` | `5` | 连续多少次超过电流阈值才确认碰撞 |
 | `recovery_confirm_threshold` | `2` | 连续多少次低于恢复阈值才确认恢复 |
-| `baseline_update_interval` | `100` | 每个关节累计多少次控制后更新一次基准电流 |
+| `baseline_update_interval` | `5` | 每个关节累计多少次控制后更新一次基准电流 |
 | `filter_window_size` | `20` | 基准电流滑动平均窗口长度 |
 | `max_position_adjustment` | `30.0°` | 单次导纳位置调整的绝对值上限 |
 
@@ -344,7 +371,9 @@ target_position = planned_position + position_diff
 > [!NOTE]
 > `current_monitor` 节点直接记录 RDK 消息中的电流数值并以 mA 标注；导纳控制节点
 > 则会将同一反馈乘以 `0.001` 后按 A 参与碰撞和力矩计算。对照日志或 CSV 时应注意
-> 两个节点显示单位不同。
+> 两个节点显示单位不同。图中的窗口平均电流和基线电流均以 mA 显示，其窗口长度
+> 和基线更新间隔与导纳控制器保持一致。电流偏差图在首次基线建立前留空，因为该
+> 阶段控制器同样不会执行阈值判断。
 
 电流监控参数：
 

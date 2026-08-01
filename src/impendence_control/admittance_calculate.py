@@ -52,8 +52,8 @@ JOINT_CONFIGS = {
         'stiffness_coeff': 0.07,
     },# 同轴
     'left_shoulder_roll': {
-        'current_threshold': 0.04,
-        'current_recovery_threshold': 0.02,
+        'current_threshold': 0.06,
+        'current_recovery_threshold': 0.04,
         'torque_slope_nm_per_a': 1.182535,
         'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
@@ -282,9 +282,9 @@ DEFAULT_CONFIG = {
 
 # 通用参数（所有关节共用）
 COMMON_PARAMS = {
-    'collision_confirm_threshold': 2,      # 碰撞确认阈值
+    'collision_confirm_threshold': 5,      # 碰撞确认阈值
     'recovery_confirm_threshold': 2,       # 恢复确认阈值
-    'baseline_update_interval': 100,       # 基准更新间隔
+    'baseline_update_interval': 5,       # 基准更新间隔
     'filter_window_size': 20,              # 滤波窗口大小
     'max_position_adjustment': 30.0,       # 最大位置调整量 (度)
 }
@@ -379,6 +379,7 @@ class MotorAdmittanceState:
     
     current_filter: CurrentFilter = field(default_factory=lambda: CurrentFilter(20))
     baseline_current: float = 0.0
+    baseline_initialized: bool = False
     sample_counter: int = 0
     
     collision_detected: bool = False
@@ -433,15 +434,28 @@ class JointAdmittanceController(Node):
         state.current_current = current
         state.current_position = position
         
-        # 电流滤波
-        state.current_filter.add_sample(state.current_current)
-        state.sample_counter += 1
-        if state.sample_counter >= COMMON_PARAMS['baseline_update_interval']:
-            state.baseline_current = state.current_filter.get_average()
-            state.sample_counter = 0
-        
-        # 碰撞检测
-        collision_detected = self._detect_collision(state, config)
+        if not state.baseline_initialized:
+            # 首次基线建立阶段只累计正常启动样本，不进行碰撞判断。
+            state.current_filter.add_sample(state.current_current)
+            state.sample_counter += 1
+            if state.sample_counter >= COMMON_PARAMS['baseline_update_interval']:
+                state.baseline_current = state.current_filter.get_average()
+                state.baseline_initialized = True
+                state.sample_counter = 0
+            collision_detected = False
+        else:
+            # 使用更新前的基线判断碰撞。疑似碰撞和已确认碰撞期间
+            # 冻结滤波窗口和基线，防止异常电流被吸收到后续基线中。
+            collision_detected = self._detect_collision(state, config)
+            if not collision_detected and state.collision_counter == 0:
+                state.current_filter.add_sample(state.current_current)
+                state.sample_counter += 1
+                if (
+                    state.sample_counter
+                    >= COMMON_PARAMS['baseline_update_interval']
+                ):
+                    state.baseline_current = state.current_filter.get_average()
+                    state.sample_counter = 0
         
         # 使用当前关节自己的标定参数，将电流 (A) 转换为力矩 (N·m)。
         state.measured_torque = current_to_torque(
@@ -497,6 +511,12 @@ class JointAdmittanceController(Node):
     
     def _detect_collision(self, state: MotorAdmittanceState, config: dict) -> bool:
         """碰撞检测（内部方法）"""
+        if not state.baseline_initialized:
+            state.collision_detected = False
+            state.collision_counter = 0
+            state.recovery_counter = 0
+            return False
+
         current_deviation = abs(state.current_current - state.baseline_current)
         
         if state.collision_detected:
@@ -553,7 +573,12 @@ class JointAdmittanceController(Node):
 力矩误差: {state.torque_error:.6f} N·m
 当前位置: {state.current_position:.2f}°
 基准电流: {state.baseline_current:.4f} A
-电流偏差: {abs(state.current_current - state.baseline_current):.4f} A
+基准状态: {'已建立' if state.baseline_initialized else '等待首次基线'}
+电流偏差: {
+    f'{abs(state.current_current - state.baseline_current):.4f} A'
+    if state.baseline_initialized
+    else '等待首次基线，未启用'
+}
 
 目标位置: {state.target_position:.2f}°
 规划位置: {state.planned_position:.2f}°
