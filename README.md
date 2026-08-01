@@ -208,6 +208,144 @@ trajectory_planner
 | `1.182535` | `-0.025172` | `right_elbow_pitch`、`left_shoulder_roll`、`left_elbow_pitch`、`right_shoulder_pitch`、`neck_pitch`、`right_hip_roll`、`right_knee_pitch`、`right_ankle_pitch`、`left_knee_pitch`、`left_ankle_pitch` |
 | `1.328629` | `-0.022189` | `right_shoulder_roll`、`right_shoulder_yaw`、`right_wrist_yaw`、`left_shoulder_yaw`、`left_wrist_yaw`、`left_shoulder_pitch`、`neck_roll`、`neck_yaw`、`waist_pitch`、`waist_roll`、`right_hip_pitch`、`left_hip_pitch`、`waist_yaw`、`right_hip_yaw`、`right_ankle_yaw`、`left_hip_roll`、`left_hip_yaw`、`left_ankle_yaw` |
 
+### 电流处理、碰撞检测与导纳计算
+
+#### 执行链路
+
+每次收到 `/joint_command` 后，导纳节点使用最近一次 `/serial_data` 缓存，按以下
+顺序处理每个关节：
+
+1. RDK 的 `currents[]` 按 mA 接收，乘以 `CURRENT_MA_TO_A = 0.001` 转换为 A。
+2. 根据 `port + board_id + motor_index` 找到对应关节的电流和实际角度。
+3. 将当前电流加入该关节的滑动窗口。
+4. 到达基准更新间隔时，用窗口平均值更新 `baseline_current`。
+5. 计算当前电流相对基准电流的绝对偏差，执行碰撞或恢复确认。
+6. 使用当前关节的斜率和截距，将当前电流转换为力矩。
+7. 计算力矩误差、速度变化和导纳位置调整量。
+8. 对位置调整量限幅；只有碰撞状态成立且调整量绝对值大于 `0.01°` 时，
+   才替换原规划角度。
+
+#### 滑动平均与基准电流
+
+`CurrentFilter` 保存最近 `filter_window_size` 个电流样本，并维护滑动和：
+
+```text
+窗口平均电流 = 窗口内电流样本之和 / 当前窗口样本数
+```
+
+默认窗口为 `20` 个样本。每个关节累计执行
+`baseline_update_interval = 100` 次控制后，才将当前窗口平均值写入
+`baseline_current`，随后计数器清零。
+
+> [!IMPORTANT]
+> 当前实现中，关节初始化时 `baseline_current = 0 A`。第一次累计到 100 个样本
+> 之前，碰撞检测使用的仍是零基准；基准更新也没有因碰撞状态而暂停。
+> 在 90 Hz 且该关节每帧均执行的情况下，20 个样本约为 `0.22 s`，
+> 100 个样本约为 `1.11 s`。实际时间会随命令频率和该关节是否参与当前命令变化。
+
+#### 碰撞检测与恢复
+
+电流偏差定义为：
+
+```text
+current_deviation = abs(current_current - baseline_current)
+```
+
+未处于碰撞状态时：
+
+```text
+current_deviation > current_threshold
+```
+
+连续满足 `collision_confirm_threshold` 次后进入碰撞状态；任意一次不满足，
+碰撞计数清零。
+
+已处于碰撞状态时：
+
+```text
+current_deviation < current_recovery_threshold
+```
+
+连续满足 `recovery_confirm_threshold` 次后退出碰撞状态；任意一次不满足，
+恢复计数清零。恢复阈值通常应小于碰撞阈值，这种双阈值设计用于避免状态在临界点
+来回抖动。
+
+默认确认次数均为 `2`。如果控制频率为 90 Hz 且每帧均执行，理论上至少需要约
+`22 ms` 的连续超限或连续恢复；实际时延还受 ROS 调度和反馈频率影响。
+
+#### 力矩与位置调整
+
+当前关节的标定力矩和力矩误差为：
+
+```text
+measured_torque = torque_slope_nm_per_a × current_current + torque_intercept_nm
+torque_error = measured_torque - expected_torque
+```
+
+代码根据实际角度计算速度及相邻两次速度变化：
+
+```text
+velocity = (current_position - last_position) / dt
+velocity_difference = velocity - last_velocity
+```
+
+导纳位置调整量为：
+
+```text
+position_diff =
+    (torque_error - damping_coeff × velocity_difference)
+    / stiffness_coeff
+```
+
+`position_diff` 会限制在
+`[-max_position_adjustment, +max_position_adjustment]`，默认最大调整量为
+`30°`。目标位置为：
+
+```text
+target_position = planned_position + position_diff
+```
+
+当 `stiffness_coeff` 接近零时，代码会放弃本次调整并返回规划位置，避免除零。
+
+#### 电流与导纳相关参数
+
+每关节参数位于 `JOINT_CONFIGS`：
+
+| 参数 | 单位 | 作用 | 调大后的主要影响 |
+| --- | --- | --- | --- |
+| `current_threshold` | A | 进入碰撞状态的电流偏差阈值 | 降低灵敏度，更不容易触发 |
+| `current_recovery_threshold` | A | 退出碰撞状态的电流偏差阈值 | 更容易退出碰撞，但过大可能产生状态抖动 |
+| `torque_slope_nm_per_a` | N·m/A | 当前关节电流—力矩模型斜率 | 相同电流对应更大的计算力矩 |
+| `torque_intercept_nm` | N·m | 当前关节电流—力矩模型截距 | 整体平移计算力矩 |
+| `expected_torque` | N·m | 导纳控制的期望力矩 | 改变力矩误差的平衡点 |
+| `damping_coeff` | 当前角度制实现的数值增益 | 抑制相邻控制周期的速度变化 | 通常减小快速位置调整 |
+| `stiffness_coeff` | 当前角度制实现的数值增益 | 力矩误差到角度调整的比例分母 | 相同力矩误差产生更小的角度调整 |
+
+所有关节共用参数位于 `COMMON_PARAMS`：
+
+| 参数 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `collision_confirm_threshold` | `2` | 连续多少次超过电流阈值才确认碰撞 |
+| `recovery_confirm_threshold` | `2` | 连续多少次低于恢复阈值才确认恢复 |
+| `baseline_update_interval` | `100` | 每个关节累计多少次控制后更新一次基准电流 |
+| `filter_window_size` | `20` | 基准电流滑动平均窗口长度 |
+| `max_position_adjustment` | `30.0°` | 单次导纳位置调整的绝对值上限 |
+
+调参建议：
+
+- 电流噪声较大时，可以增大 `filter_window_size` 或确认次数，但响应会变慢。
+- 环境负载变化较慢但明显时，可以缩短 `baseline_update_interval`；过短可能让基准
+  跟随碰撞电流漂移。
+- 应先根据正常运动电流波动设置碰撞和恢复阈值，再调节刚度、阻尼与最大调整量。
+- 修改斜率或截距后，应重新检查 `expected_torque` 和实际位置调整方向。
+- 腿部当前部分碰撞阈值为 `2 A`，明显高于上肢配置；调试时应结合实际电流曲线
+  判断这是有意屏蔽还是最终阈值。
+
+> [!NOTE]
+> `current_monitor` 节点直接记录 RDK 消息中的电流数值并以 mA 标注；导纳控制节点
+> 则会将同一反馈乘以 `0.001` 后按 A 参与碰撞和力矩计算。对照日志或 CSV 时应注意
+> 两个节点显示单位不同。
+
 电流监控参数：
 
 | 参数 | 含义 | 默认值 |
