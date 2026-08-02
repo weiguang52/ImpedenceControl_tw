@@ -112,8 +112,8 @@ ros2 run impendence_control current_monitor --ros-args \
 
 右轴状态按照控制器相同的逻辑重建：首次基线建立前保持关闭；电流偏差连续达到
 `collision_confirm_threshold` 次超过碰撞阈值后变为开启；连续达到
-`recovery_confirm_threshold` 次满足恢复条件后恢复为关闭。恢复后进入短暂的
-重新武装期，期间基线继续跟随长窗口但不重新触发碰撞。
+`recovery_confirm_threshold` 次满足方向感知恢复条件后恢复为关闭。恢复后清空
+旧长窗口并进入重新武装期，期间从当前无阻碍电流重建长窗口和基线，不触发碰撞。
 
 不再按关节名称分别输出单关节 PNG；两个 PNG 都使用多子图总览方式。
 
@@ -121,8 +121,9 @@ ros2 run impendence_control current_monitor --ros-args \
 虚线阶梯为锁存基线；不再绘制全部样本的总体平均线。短窗口始终连续计算。正常
 状态下长窗口持续采样，绿色基线逐点复制青色长窗口；短窗口相对基线第一次超过
 碰撞阈值时，长窗口和绿色基线同时冻结。满足恢复确认条件后，长窗口恢复采样，
-绿色基线重新复制长窗口并继续跟随。灰色背景区域表示冷启动屏蔽期，该区域只绘制
-原始电流，短窗口、长窗口、基线和 deviation 都不计算。
+旧长窗口样本被丢弃，绿色基线根据释放后的新样本重新建立并继续跟随。灰色背景
+区域表示冷启动屏蔽期，该区域只绘制原始电流，短窗口、长窗口、基线和 deviation
+都不计算。
 
 短、长窗口长度分别读取 `COMMON_PARAMS['short_filter_window_size']` 和
 `COMMON_PARAMS['long_filter_window_size']`。长窗口填满前不执行碰撞判断，避免
@@ -251,7 +252,8 @@ trajectory_planner
 3. 根据 `port + board_id + motor_index` 找到对应关节的电流和实际角度。
 4. 当前电流始终加入 5 点短窗口；正常状态下同时加入 30 点长窗口。
 5. 正常状态下，让 `baseline_current` 逐点跟随长窗口电流。
-6. 使用短窗口电流与更新前基线的绝对偏差，执行长窗口/基线锁存、碰撞或恢复确认。
+6. 使用短窗口电流与更新前基线的绝对偏差触发碰撞，并使用首次超限时记录的偏差
+   方向判断阻碍是否解除。
 7. 使用当前关节的斜率和截距，将当前电流转换为力矩。
 8. 计算力矩误差、速度变化和导纳位置调整量。
 9. 对位置调整量限幅；只有碰撞状态成立且调整量绝对值大于 `0.01°` 时，
@@ -276,8 +278,8 @@ trajectory_planner
 > 不会执行电流偏差阈值判断，也不会进入碰撞状态；首次基线建立后才启用
 > 碰撞与恢复判断。冷启动结束后，短窗口在任何状态下都持续计算；第一次超出碰撞
 > 阈值时，长窗口和基线电流同时冻结，疑似碰撞与已确认碰撞期间的样本都不会进入
-> 长窗口。满足
-> 恢复确认条件后，长窗口恢复采样，基线重新复制长窗口并开始逐点跟随。
+> 长窗口。满足恢复确认条件后清空旧长窗口，在重新武装期内使用释放后的电流重新
+> 填满长窗口，基线复制新长窗口并逐点跟随。
 > 在 90 Hz 且该关节每帧均执行的情况下，短窗口约为 `0.06 s`，长窗口约为
 > `0.33 s`，因此碰撞检测最早约在启动后 `1.33 s` 开始。实际时间会随命令频率
 > 和该关节是否参与当前命令变化。
@@ -289,6 +291,7 @@ trajectory_planner
 ```text
 short_current = short_filter.get_average()
 long_current = long_filter.get_average()
+signed_deviation = short_current - baseline_current
 current_deviation = abs(short_current - baseline_current)
 ```
 
@@ -300,24 +303,31 @@ current_deviation > current_threshold
 
 第一次满足条件时立即冻结基线，并从该次开始累计；连续满足
 `collision_confirm_threshold` 次后进入碰撞状态。尚未确认碰撞时，若偏差不再
-超过碰撞阈值则碰撞计数清零，但基线保持冻结，直到满足恢复确认条件。
+超过碰撞阈值则碰撞计数清零。第一次超限时同时记录：
+
+```text
+collision_direction = sign(signed_deviation)
+```
+
+后续的碰撞确认只累计原碰撞方向上的连续超限，避免电流越过基线后在相反方向上
+继续累计同一次碰撞。
 
 已处于碰撞状态时：
 
 ```text
-abs(short_current - baseline_current) < current_recovery_threshold
+directional_deviation = collision_direction × signed_deviation
+directional_deviation < current_recovery_threshold
 ```
 
 连续满足 `recovery_confirm_threshold` 次后退出碰撞状态；任意一次不满足，恢复
-计数清零。退出后长窗口恢复采样，并等待 `recovery_rearm_samples` 个样本重新
-武装检测；在此期间基线持续跟随长窗口。恢复阈值通常应小于碰撞阈值，这种双阈值
-设计用于避免状态抖动和快速回程误触发。
+计数清零。因为恢复偏差保留了碰撞方向，所以电流越过冻结基线时，
+`directional_deviation` 会变为负数，可正确识别为卸载或回弹，不会因绝对偏差
+仍然很大而继续保持碰撞。
 
-> [!NOTE]
-> 本次快照中的恢复判断仍使用绝对偏差。如果阻碍解除后电流越过冻结基线，或者
-> 机器人在新的无阻碍负载下稳定，但电流没有回到旧基线附近，绝对偏差仍可能大于
-> 恢复阈值，导纳状态会继续保持开启。后续版本需要记录碰撞偏差方向，并在解除后
-> 进入禁止重复触发的基线重建阶段。
+退出碰撞后会清空旧长窗口，并等待 `recovery_rearm_samples` 个释放后样本重新
+建立长窗口和基线；在此期间导纳关闭、碰撞检测禁用。这样新的无阻碍负载电流不会
+继续与碰撞前的旧基线比较。恢复阈值通常应小于碰撞阈值，方向判断、双阈值和重新
+武装期共同用于避免状态抖动和放开阻碍后的误触发。
 
 当前碰撞确认次数为 `5`，恢复确认次数为 `5`。如果控制频率为 90 Hz 且每帧均
 执行，理论上两者分别需要约 `56 ms`；滑动平均窗口本身还会增加响应延迟，
@@ -379,7 +389,7 @@ target_position = planned_position + position_diff
 | `recovery_confirm_threshold` | `5` | 连续多少次满足恢复条件才确认恢复 |
 | `short_filter_window_size` | `5` | 碰撞响应短窗口长度 |
 | `long_filter_window_size` | `30` | 正常趋势与基线候选长窗口长度 |
-| `recovery_rearm_samples` | `30` | 恢复后暂不重新触发碰撞的样本数 |
+| `recovery_rearm_samples` | `30` | 恢复后重建长窗口且暂不触发碰撞的样本数 |
 | `cold_start_ignore_duration_sec` | `1.0 s` | 每个关节首次处理时完全忽略电流的时长 |
 | `max_position_adjustment` | `30.0°` | 单次导纳位置调整的绝对值上限 |
 

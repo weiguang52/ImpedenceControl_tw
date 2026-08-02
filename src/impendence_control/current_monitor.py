@@ -321,6 +321,7 @@ class CurrentMonitor(Node):
         sample_counter = 0
 
         admittance_enabled = False
+        collision_direction = 0
         collision_counter = 0
         recovery_counter = 0
         rearm_counter = 0
@@ -367,6 +368,7 @@ class CurrentMonitor(Node):
                 else:
                     deviation = float('nan')
                 admittance_enabled = False
+                collision_direction = 0
                 baseline_frozen = False
                 collision_counter = 0
                 recovery_counter = 0
@@ -387,17 +389,25 @@ class CurrentMonitor(Node):
                     )
                     baseline_frozen = False
                     admittance_enabled = False
+                    collision_direction = 0
                     collision_counter = 0
                     recovery_counter = 0
                     rearm_counter -= 1
                 elif not baseline_frozen:
                     if deviation > collision_threshold:
                         baseline_frozen = True
+                        signed_deviation = (
+                            filtered_current - baseline_current
+                        )
+                        collision_direction = (
+                            1 if signed_deviation >= 0.0 else -1
+                        )
                         collision_counter = 1
                         recovery_counter = 0
                         if collision_counter >= collision_confirm_count:
                             admittance_enabled = True
                     else:
+                        collision_direction = 0
                         collision_counter = 0
                         recovery_counter = 0
                         long_buffer.append(current)
@@ -412,7 +422,18 @@ class CurrentMonitor(Node):
                             filtered_current - baseline_current
                         )
                 else:
-                    if deviation < recovery_threshold:
+                    signed_deviation = (
+                        filtered_current - baseline_current
+                    )
+                    if collision_direction == 0:
+                        collision_direction = (
+                            1 if signed_deviation >= 0.0 else -1
+                        )
+                    directional_deviation = (
+                        collision_direction * signed_deviation
+                    )
+
+                    if directional_deviation < recovery_threshold:
                         recovery_counter += 1
                         if not admittance_enabled:
                             collision_counter = 0
@@ -420,12 +441,19 @@ class CurrentMonitor(Node):
                         if recovery_counter >= recovery_confirm_count:
                             admittance_enabled = False
                             baseline_frozen = False
+                            collision_direction = 0
                             collision_counter = 0
                             recovery_counter = 0
-                            rearm_counter = recovery_rearm_samples
+                            long_buffer.clear()
+                            long_sum = 0.0
+                            baseline_candidate_current = 0.0
+                            rearm_counter = max(
+                                0,
+                                recovery_rearm_samples - 1,
+                            )
                     else:
                         recovery_counter = 0
-                        if deviation > collision_threshold:
+                        if directional_deviation > collision_threshold:
                             if not admittance_enabled:
                                 collision_counter += 1
                                 if (

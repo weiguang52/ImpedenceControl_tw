@@ -365,6 +365,11 @@ class CurrentFilter:
             return 0.0
         return self.sum_value / len(self.buffer)
 
+    def clear(self):
+        """清空窗口，用于解除碰撞后重新建立基线。"""
+        self.buffer.clear()
+        self.sum_value = 0.0
+
 
 @dataclass
 class MotorAdmittanceState:
@@ -372,6 +377,7 @@ class MotorAdmittanceState:
     joint_id: str = ""
     current_current: float = 0.0
     filtered_current: float = 0.0
+    signed_current_deviation: float = 0.0
     current_deviation: float = 0.0
     measured_torque: float = 0.0
     torque_error: float = 0.0
@@ -393,6 +399,7 @@ class MotorAdmittanceState:
     warmup_completed: bool = False
     
     collision_detected: bool = False
+    collision_direction: int = 0
     collision_counter: int = 0
     recovery_counter: int = 0
     
@@ -462,11 +469,14 @@ class JointAdmittanceController(Node):
             # 不检测碰撞，也不输出任何导纳位置调整。
             state.filtered_current = 0.0
             state.baseline_candidate_current = 0.0
+            state.signed_current_deviation = 0.0
             state.current_deviation = 0.0
             state.collision_detected = False
+            state.collision_direction = 0
             state.baseline_frozen = False
             state.collision_counter = 0
             state.recovery_counter = 0
+            state.rearm_counter = 0
             state.target_position = state.planned_position
             state.last_current = state.current_current
             state.last_position = state.current_position
@@ -499,6 +509,7 @@ class JointAdmittanceController(Node):
                 state.baseline_initialized = True
                 state.sample_counter = 0
             state.current_deviation = 0.0
+            state.signed_current_deviation = 0.0
             collision_detected = False
         else:
             if state.rearm_counter > 0:
@@ -509,11 +520,15 @@ class JointAdmittanceController(Node):
                     state.baseline_filter.get_average()
                 )
                 state.baseline_current = state.baseline_candidate_current
-                state.current_deviation = abs(
+                state.signed_current_deviation = (
                     state.filtered_current - state.baseline_current
+                )
+                state.current_deviation = abs(
+                    state.signed_current_deviation
                 )
                 state.baseline_frozen = False
                 state.collision_detected = False
+                state.collision_direction = 0
                 state.collision_counter = 0
                 state.recovery_counter = 0
                 state.rearm_counter -= 1
@@ -530,8 +545,11 @@ class JointAdmittanceController(Node):
                     state.baseline_current = (
                         state.baseline_candidate_current
                     )
-                    state.current_deviation = abs(
+                    state.signed_current_deviation = (
                         state.filtered_current - state.baseline_current
+                    )
+                    state.current_deviation = abs(
+                        state.signed_current_deviation
                     )
         
         # 使用当前关节自己的标定参数，将电流 (A) 转换为力矩 (N·m)。
@@ -573,6 +591,7 @@ class JointAdmittanceController(Node):
             f'long_current: {state.baseline_candidate_current:.6f} A  '
             f'baseline: {state.baseline_current:.6f} A  '
             f'baseline_frozen: {state.baseline_frozen}  '
+            f'collision_direction: {state.collision_direction:+d}  '
             f'measured_torque: {state.measured_torque:.6f} N·m  '
             f'torque_error: {state.torque_error:.6f} N·m  '
             f'position_diff: {position_diff}'
@@ -599,15 +618,20 @@ class JointAdmittanceController(Node):
             state.recovery_counter = 0
             return False
 
-        current_deviation = abs(
+        signed_deviation = (
             state.filtered_current - state.baseline_current
         )
+        current_deviation = abs(signed_deviation)
+        state.signed_current_deviation = signed_deviation
         state.current_deviation = current_deviation
 
         if not state.baseline_frozen:
             if current_deviation > config['current_threshold']:
                 # 第一次超阈值就冻结基线，从本次开始累计碰撞确认次数。
                 state.baseline_frozen = True
+                state.collision_direction = (
+                    1 if signed_deviation >= 0.0 else -1
+                )
                 state.collision_counter = 1
                 state.recovery_counter = 0
                 if (
@@ -616,12 +640,22 @@ class JointAdmittanceController(Node):
                 ):
                     state.collision_detected = True
             else:
+                state.collision_direction = 0
                 state.collision_counter = 0
                 state.recovery_counter = 0
             return state.collision_detected
 
         # 基线已冻结：短窗口继续计算，长窗口与绿色基线都保持不变。
-        if current_deviation < config['current_recovery_threshold']:
+        collision_direction = state.collision_direction
+        if collision_direction == 0:
+            collision_direction = 1 if signed_deviation >= 0.0 else -1
+            state.collision_direction = collision_direction
+        directional_deviation = collision_direction * signed_deviation
+
+        # 恢复只检查原碰撞方向上的剩余偏差。偏差越过基线、方向反转时，
+        # directional_deviation 会变为负值，因此会被识别为卸载/回弹，
+        # 而不是因为绝对偏差仍很大而继续保持碰撞。
+        if directional_deviation < config['current_recovery_threshold']:
             state.recovery_counter += 1
             if not state.collision_detected:
                 state.collision_counter = 0
@@ -632,15 +666,26 @@ class JointAdmittanceController(Node):
             ):
                 state.collision_detected = False
                 state.baseline_frozen = False
+                state.collision_direction = 0
                 state.collision_counter = 0
                 state.recovery_counter = 0
-                state.rearm_counter = COMMON_PARAMS['recovery_rearm_samples']
-                print(f"✓ 关节 {state.joint_id}: 基线解冻/碰撞恢复")
+                # 丢弃碰撞前的长窗口。当前样本会在调用方立即成为
+                # 新长窗口的第一个样本，其余样本在重新武装期内补齐。
+                state.baseline_filter.clear()
+                state.baseline_candidate_current = 0.0
+                state.rearm_counter = max(
+                    0,
+                    int(COMMON_PARAMS['recovery_rearm_samples']) - 1,
+                )
+                print(
+                    f"✓ 关节 {state.joint_id}: 碰撞解除，"
+                    "开始重建基线"
+                )
                 return False
         else:
             state.recovery_counter = 0
 
-            if current_deviation > config['current_threshold']:
+            if directional_deviation > config['current_threshold']:
                 if not state.collision_detected:
                     state.collision_counter += 1
                     if (
@@ -702,6 +747,8 @@ class JointAdmittanceController(Node):
 位置调整: {state.target_position - state.planned_position:.2f}°
 
 碰撞状态: {'是' if state.collision_detected else '否'}
+碰撞方向: {state.collision_direction:+d}
+恢复重建剩余样本: {state.rearm_counter}
 
 控制参数:
   - 阻尼系数: {config['damping_coeff']}
