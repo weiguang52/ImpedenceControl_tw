@@ -255,9 +255,9 @@ trajectory_planner
 6. 使用短窗口电流与更新前基线的绝对偏差触发碰撞，并使用首次超限时记录的偏差
    方向判断阻碍是否解除。
 7. 使用当前关节的斜率和截距，将当前电流转换为力矩。
-8. 计算力矩误差、速度变化和导纳位置调整量。
-9. 对位置调整量限幅；只有碰撞状态成立且调整量绝对值大于 `0.01°` 时，
-   才替换原规划角度。
+8. 计算力矩误差、速度变化和本周期新增调控量。
+9. 碰撞状态下累计调控量并对累计总量限幅；累计量绝对值大于 `0.01°` 时，
+   使用“规划角度 + 累计调控量”替换原规划角度。
 
 #### 滑动平均与基准电流
 
@@ -349,21 +349,31 @@ velocity = (current_position - last_position) / dt
 velocity_difference = velocity - last_velocity
 ```
 
-导纳位置调整量为：
+每个控制周期首先计算本周期新增调控量：
 
 ```text
-position_diff =
+position_adjustment_increment =
     (torque_error - damping_coeff × velocity_difference)
     / stiffness_coeff
 ```
 
-`position_diff` 会限制在
-`[-max_position_adjustment, +max_position_adjustment]`，默认最大调整量为
-`30°`。目标位置为：
+碰撞状态持续期间，本周期新增量会叠加到上一周期保留的累计调控量；限幅作用于
+累计总量，而不是单独作用于本周期新增量：
 
 ```text
-target_position = planned_position + position_diff
+accumulated_position_adjustment = clamp(
+    accumulated_position_adjustment + position_adjustment_increment,
+    -max_position_adjustment,
+    +max_position_adjustment
+)
+
+target_position =
+    planned_position + accumulated_position_adjustment
 ```
+
+因此，即使规划角度保持不变，上一次已经应用的调控量也会在下一周期保留，并继续
+叠加本周期计算出的新增量。碰撞解除、冷启动屏蔽或刚度参数无效时，累计调控量复位
+为 `0°`，目标位置回到当前规划轨迹。默认累计调控量最大绝对值为 `30°`。
 
 当 `stiffness_coeff` 接近零时，代码会放弃本次调整并返回规划位置，避免除零。
 
@@ -391,7 +401,7 @@ target_position = planned_position + position_diff
 | `long_filter_window_size` | `30` | 正常趋势与基线候选长窗口长度 |
 | `recovery_rearm_samples` | `30` | 恢复后重建长窗口且暂不触发碰撞的样本数 |
 | `cold_start_ignore_duration_sec` | `1.0 s` | 每个关节首次处理时完全忽略电流的时长 |
-| `max_position_adjustment` | `30.0°` | 单次导纳位置调整的绝对值上限 |
+| `max_position_adjustment` | `30.0°` | 累计导纳调控量的绝对值上限 |
 
 调参建议：
 

@@ -58,7 +58,7 @@ JOINT_CONFIGS = {
         'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
         'damping_coeff': 0.0001,
-        'stiffness_coeff': 0.07,
+        'stiffness_coeff': 0.1,
     },# 垂直轴
     'left_shoulder_yaw': {
         'current_threshold': 0.02,
@@ -386,6 +386,8 @@ class MotorAdmittanceState:
     last_position: float = 0.0
     target_position: float = 0.0
     planned_position: float = 0.0
+    position_adjustment_increment: float = 0.0
+    accumulated_position_adjustment: float = 0.0
     
     current_filter: CurrentFilter = field(default_factory=lambda: CurrentFilter(5))
     baseline_filter: CurrentFilter = field(default_factory=lambda: CurrentFilter(30))
@@ -478,6 +480,8 @@ class JointAdmittanceController(Node):
             state.recovery_counter = 0
             state.rearm_counter = 0
             state.target_position = state.planned_position
+            state.position_adjustment_increment = 0.0
+            state.accumulated_position_adjustment = 0.0
             state.last_current = state.current_current
             state.last_position = state.current_position
             state.last_velocity = 0.0
@@ -574,16 +578,32 @@ class JointAdmittanceController(Node):
             self.get_logger().error(
                 f'关节 {joint_id} 的 stiffness_coeff 不能为 0，跳过本次导纳调整'
             )
+            state.position_adjustment_increment = 0.0
+            state.accumulated_position_adjustment = 0.0
+            state.target_position = state.planned_position
             return collision_detected, state.planned_position
 
         position_diff = (
             state.torque_error
             - config['damping_coeff'] * velocity_difference
         ) / stiffness
-        
-        # 限幅
-        max_adj = COMMON_PARAMS['max_position_adjustment']
-        position_diff = max(min(position_diff, max_adj), -max_adj)
+
+        # position_diff 是本周期新增的调控量。碰撞持续期间将其累加到
+        # 上一周期的调控偏移，再对累计总量限幅；碰撞解除后累计量复位，
+        # 目标位置回到当前规划轨迹。
+        state.position_adjustment_increment = position_diff
+        if collision_detected:
+            accumulated_adjustment = (
+                state.accumulated_position_adjustment + position_diff
+            )
+            max_adj = COMMON_PARAMS['max_position_adjustment']
+            state.accumulated_position_adjustment = max(
+                min(accumulated_adjustment, max_adj),
+                -max_adj,
+            )
+        else:
+            state.accumulated_position_adjustment = 0.0
+
         self.get_logger().info(
             f'collision_detected: {collision_detected}  '
             f'current: {state.current_current:.6f} A  '
@@ -594,11 +614,16 @@ class JointAdmittanceController(Node):
             f'collision_direction: {state.collision_direction:+d}  '
             f'measured_torque: {state.measured_torque:.6f} N·m  '
             f'torque_error: {state.torque_error:.6f} N·m  '
-            f'position_diff: {position_diff}'
+            f'position_increment: {state.position_adjustment_increment:.6f}°  '
+            f'accumulated_adjustment: '
+            f'{state.accumulated_position_adjustment:.6f}°'
         )
         
         # 更新目标位置
-        state.target_position = state.planned_position + position_diff
+        state.target_position = (
+            state.planned_position
+            + state.accumulated_position_adjustment
+        )
         self.get_logger().info(f'target_position:  {state.target_position}')
         
         # 更新历史数据
@@ -744,7 +769,8 @@ class JointAdmittanceController(Node):
 
 目标位置: {state.target_position:.2f}°
 规划位置: {state.planned_position:.2f}°
-位置调整: {state.target_position - state.planned_position:.2f}°
+本周期新增调控量: {state.position_adjustment_increment:.2f}°
+累计调控量: {state.accumulated_position_adjustment:.2f}°
 
 碰撞状态: {'是' if state.collision_detected else '否'}
 碰撞方向: {state.collision_direction:+d}
