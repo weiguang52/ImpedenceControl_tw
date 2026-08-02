@@ -56,9 +56,10 @@ JOINT_CONFIGS = {
         'current_recovery_threshold': 0.03,
         'torque_slope_nm_per_a': 1.182535,
         'torque_intercept_nm': -0.025172,
-        'expected_torque': 0.0004,
-        'damping_coeff': 0.0001,
-        'stiffness_coeff': 0.1,
+        'expected_torque': 0.04,
+        'admittance_direction': -1.0,
+        'damping_coeff': 0.001,
+        'stiffness_coeff': 1.0,
     },# 垂直轴
     'left_shoulder_yaw': {
         'current_threshold': 0.02,
@@ -276,6 +277,7 @@ DEFAULT_CONFIG = {
     'torque_slope_nm_per_a': 1.328629,
     'torque_intercept_nm': -0.022189,
     'expected_torque': 0.0,
+    'admittance_direction': 1.0,
     'damping_coeff': 10.0,
     'stiffness_coeff': 100.0,
 }
@@ -583,8 +585,14 @@ class JointAdmittanceController(Node):
             state.target_position = state.planned_position
             return collision_detected, state.planned_position
 
+        admittance_direction = float(
+            config.get('admittance_direction', 1.0)
+        )
+        directed_torque_error = (
+            admittance_direction * state.torque_error
+        )
         position_diff = (
-            state.torque_error
+            directed_torque_error
             - config['damping_coeff'] * velocity_difference
         ) / stiffness
 
@@ -612,6 +620,7 @@ class JointAdmittanceController(Node):
             f'baseline: {state.baseline_current:.6f} A  '
             f'baseline_frozen: {state.baseline_frozen}  '
             f'collision_direction: {state.collision_direction:+d}  '
+            f'admittance_direction: {admittance_direction:+.1f}  '
             f'measured_torque: {state.measured_torque:.6f} N·m  '
             f'torque_error: {state.torque_error:.6f} N·m  '
             f'position_increment: {state.position_adjustment_increment:.6f}°  '
@@ -779,6 +788,7 @@ class JointAdmittanceController(Node):
 控制参数:
   - 阻尼系数: {config['damping_coeff']}
   - 刚度系数: {config['stiffness_coeff']}
+  - 导纳方向: {config.get('admittance_direction', 1.0):+.1f}
   - 电流阈值: {config['current_threshold']}A
   - 电流—力矩模型: torque = {config['torque_slope_nm_per_a']} * current {config['torque_intercept_nm']:+} N·m
 ===============================================

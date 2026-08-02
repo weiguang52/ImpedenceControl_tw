@@ -352,10 +352,17 @@ velocity_difference = velocity - last_velocity
 每个控制周期首先计算本周期新增调控量：
 
 ```text
+directed_torque_error = admittance_direction × torque_error
+
 position_adjustment_increment =
-    (torque_error - damping_coeff × velocity_difference)
+    (directed_torque_error - damping_coeff × velocity_difference)
     / stiffness_coeff
 ```
+
+`admittance_direction` 按关节独立配置。`+1` 保持电流—力矩模型的原方向，`-1`
+只反转外力对应的让步方向，阻尼项仍保持抑制运动变化的符号。根据
+`left_shoulder_roll` 的实机阻挡测试，该关节设为 `-1.0`；其余未显式配置的关节
+默认使用 `+1.0`，需要逐关节通过低限幅实机测试确认。
 
 碰撞状态持续期间，本周期新增量会叠加到上一周期保留的累计调控量；限幅作用于
 累计总量，而不是单独作用于本周期新增量：
@@ -388,6 +395,7 @@ target_position =
 | `torque_slope_nm_per_a` | N·m/A | 当前关节电流—力矩模型斜率 | 相同电流对应更大的计算力矩 |
 | `torque_intercept_nm` | N·m | 当前关节电流—力矩模型截距 | 整体平移计算力矩 |
 | `expected_torque` | N·m | 导纳控制的期望力矩 | 改变力矩误差的平衡点 |
+| `admittance_direction` | `+1` 或 `-1` | 当前关节外力到让步方向的符号 | 只反转力矩产生的调控方向 |
 | `damping_coeff` | 当前角度制实现的数值增益 | 抑制相邻控制周期的速度变化 | 通常减小快速位置调整 |
 | `stiffness_coeff` | 当前角度制实现的数值增益 | 力矩误差到角度调整的比例分母 | 相同力矩误差产生更小的角度调整 |
 
