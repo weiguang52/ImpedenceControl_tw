@@ -56,14 +56,14 @@ ros2 run impendence_control admittance_control --ros-args \
 ros2 run impendence_control trajectory_planner --ros-args \
   -p joint_name:="left_shoulder_roll" \
   -p start_pos:=200.0 \
-  -p end_pos:=290.0 \
+  -p end_pos:=320.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
   -p auto_start:=true
 
 ros2 run impendence_control trajectory_planner --ros-args \
   -p joint_name:="left_shoulder_roll" \
-  -p start_pos:=290.0 \
+  -p start_pos:=320.0 \
   -p end_pos:=200.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
@@ -104,24 +104,29 @@ ros2 run impendence_control current_monitor --ros-args \
 
 - `current_data_<时间>.csv`：时间、电流和关节名称。
 - `current_plot_<时间>.png`：全部活动关节的电流总览，同时绘制原始电流、
-  滑动窗口平均电流和基线电流。
+  5 点短窗口、30 点长窗口和锁存基线。
 - `current_deviation_<时间>.png`：全部活动关节的电流偏差总览，绘制首次基线
-  建立后的 `|实际电流 - 基线电流|`，并标出各关节的碰撞阈值与恢复阈值。
+  建立后的 `|短窗口电流 - 锁存基线|`，并标出各关节的碰撞阈值与恢复阈值。
   每个子图右侧纵轴显示导纳状态：`0 / Disabled` 表示未启动，
   `1 / Enabled` 表示已启动。
 
 右轴状态按照控制器相同的逻辑重建：首次基线建立前保持关闭；电流偏差连续达到
 `collision_confirm_threshold` 次超过碰撞阈值后变为开启；连续达到
-`recovery_confirm_threshold` 次低于恢复阈值后恢复为关闭。
+`recovery_confirm_threshold` 次满足恢复条件后恢复为关闭。恢复后进入短暂的
+重新武装期，期间基线继续跟随长窗口但不重新触发碰撞。
 
 不再按关节名称分别输出单关节 PNG；两个 PNG 都使用多子图总览方式。
 
-图中的蓝线为原始电流，橙线为窗口平均电流，绿色虚线阶梯为基线电流；不再绘制
-全部样本的总体平均线。
-窗口长度直接复用导纳控制 `COMMON_PARAMS['filter_window_size']`，当前默认是
-`20` 点；因此修改导纳滤波窗口后，电流监控输出图会自动使用相同窗口。窗口尚未
-填满时，平均值使用当前已有的全部样本计算。基线初始为 `0 mA`，每累计
-`COMMON_PARAMS['baseline_update_interval']` 个样本后更新为当时的窗口平均值。
+图中的蓝线为原始电流，橙线为 5 点短窗口电流，青线为 30 点长窗口电流，绿色
+虚线阶梯为锁存基线；不再绘制全部样本的总体平均线。短窗口始终连续计算。正常
+状态下长窗口持续采样，绿色基线逐点复制青色长窗口；短窗口相对基线第一次超过
+碰撞阈值时，长窗口和绿色基线同时冻结。满足恢复确认条件后，长窗口恢复采样，
+绿色基线重新复制长窗口并继续跟随。灰色背景区域表示冷启动屏蔽期，该区域只绘制
+原始电流，短窗口、长窗口、基线和 deviation 都不计算。
+
+短、长窗口长度分别读取 `COMMON_PARAMS['short_filter_window_size']` 和
+`COMMON_PARAMS['long_filter_window_size']`。长窗口填满前不执行碰撞判断，避免
+启动瞬态误触发；窗口尚未填满时，图中的平均值使用已有样本计算。
 
 同时会在终端按“串口号 + 板号”打印 `/serial_data` 反馈条数：
 
@@ -240,42 +245,51 @@ trajectory_planner
 每次收到 `/joint_command` 后，导纳节点使用最近一次 `/serial_data` 缓存，按以下
 顺序处理每个关节：
 
-1. RDK 的 `currents[]` 按 mA 接收，乘以 `CURRENT_MA_TO_A = 0.001` 转换为 A。
-2. 根据 `port + board_id + motor_index` 找到对应关节的电流和实际角度。
-3. 将当前电流加入该关节的滑动窗口。
-4. 到达基准更新间隔时，用窗口平均值更新 `baseline_current`。
-5. 计算当前电流相对基准电流的绝对偏差，执行碰撞或恢复确认。
-6. 使用当前关节的斜率和截距，将当前电流转换为力矩。
-7. 计算力矩误差、速度变化和导纳位置调整量。
-8. 对位置调整量限幅；只有碰撞状态成立且调整量绝对值大于 `0.01°` 时，
+1. 每个关节首次进入导纳处理后，先执行 `1.0 s` 冷启动屏蔽；期间完全忽略电流，
+   不更新窗口、不建立基线、不判断碰撞，也不输出导纳调整。
+2. RDK 的 `currents[]` 按 mA 接收，乘以 `CURRENT_MA_TO_A = 0.001` 转换为 A。
+3. 根据 `port + board_id + motor_index` 找到对应关节的电流和实际角度。
+4. 当前电流始终加入 5 点短窗口；正常状态下同时加入 30 点长窗口。
+5. 正常状态下，让 `baseline_current` 逐点跟随长窗口电流。
+6. 使用短窗口电流与更新前基线的绝对偏差，执行长窗口/基线锁存、碰撞或恢复确认。
+7. 使用当前关节的斜率和截距，将当前电流转换为力矩。
+8. 计算力矩误差、速度变化和导纳位置调整量。
+9. 对位置调整量限幅；只有碰撞状态成立且调整量绝对值大于 `0.01°` 时，
    才替换原规划角度。
 
 #### 滑动平均与基准电流
 
-`CurrentFilter` 保存最近 `filter_window_size` 个电流样本，并维护滑动和：
+两个 `CurrentFilter` 分别保存短窗口和长窗口样本，并维护滑动和：
 
 ```text
-窗口平均电流 = 窗口内电流样本之和 / 当前窗口样本数
+短窗口电流 = 最近 5 个电流样本之和 / 当前短窗口样本数
+长窗口电流 = 最近 30 个电流样本之和 / 当前长窗口样本数
 ```
 
-默认窗口为 `20` 个样本。每个关节累计执行
-`baseline_update_interval = 5` 次控制后，才将当前窗口平均值写入
-`baseline_current`，随后计数器清零。
+默认短窗口为 `5` 个样本，长窗口为 `30` 个样本。长窗口填满后，使用当时的
+长窗口电流建立首次基线。首次基线建立后，正常状态下每次控制都会让基线复制
+最新长窗口电流。
 
 > [!IMPORTANT]
-> 当前实现中，关节初始化时 `baseline_current = 0 A`。第一次累计到 5 个样本
-> 之前不会执行电流偏差阈值判断，也不会进入碰撞状态；首次基线建立后才启用
-> 碰撞与恢复判断。出现疑似碰撞或进入碰撞状态后，会冻结基线滤波窗口和基线
-> 电流，异常电流不会参与后续基线计算；恢复后才重新采集正常电流并继续更新。
-> 在 90 Hz 且该关节每帧均执行的情况下，5 个样本约为 `0.06 s`。实际时间会
-> 随命令频率和该关节是否参与当前命令变化。
+> 当前实现中，关节初始化时 `baseline_current = 0 A`。前 `1.0 s` 冷启动电流
+> 完全丢弃，屏蔽结束后才从空窗口开始累计。随后长窗口填满 30 个有效样本之前
+> 不会执行电流偏差阈值判断，也不会进入碰撞状态；首次基线建立后才启用
+> 碰撞与恢复判断。冷启动结束后，短窗口在任何状态下都持续计算；第一次超出碰撞
+> 阈值时，长窗口和基线电流同时冻结，疑似碰撞与已确认碰撞期间的样本都不会进入
+> 长窗口。满足
+> 恢复确认条件后，长窗口恢复采样，基线重新复制长窗口并开始逐点跟随。
+> 在 90 Hz 且该关节每帧均执行的情况下，短窗口约为 `0.06 s`，长窗口约为
+> `0.33 s`，因此碰撞检测最早约在启动后 `1.33 s` 开始。实际时间会随命令频率
+> 和该关节是否参与当前命令变化。
 
 #### 碰撞检测与恢复
 
 电流偏差定义为：
 
 ```text
-current_deviation = abs(current_current - baseline_current)
+short_current = short_filter.get_average()
+long_current = long_filter.get_average()
+current_deviation = abs(short_current - baseline_current)
 ```
 
 未处于碰撞状态时：
@@ -284,21 +298,30 @@ current_deviation = abs(current_current - baseline_current)
 current_deviation > current_threshold
 ```
 
-连续满足 `collision_confirm_threshold` 次后进入碰撞状态；任意一次不满足，
-碰撞计数清零。
+第一次满足条件时立即冻结基线，并从该次开始累计；连续满足
+`collision_confirm_threshold` 次后进入碰撞状态。尚未确认碰撞时，若偏差不再
+超过碰撞阈值则碰撞计数清零，但基线保持冻结，直到满足恢复确认条件。
 
 已处于碰撞状态时：
 
 ```text
-current_deviation < current_recovery_threshold
+abs(short_current - baseline_current) < current_recovery_threshold
 ```
 
-连续满足 `recovery_confirm_threshold` 次后退出碰撞状态；任意一次不满足，
-恢复计数清零。恢复阈值通常应小于碰撞阈值，这种双阈值设计用于避免状态在临界点
-来回抖动。
+连续满足 `recovery_confirm_threshold` 次后退出碰撞状态；任意一次不满足，恢复
+计数清零。退出后长窗口恢复采样，并等待 `recovery_rearm_samples` 个样本重新
+武装检测；在此期间基线持续跟随长窗口。恢复阈值通常应小于碰撞阈值，这种双阈值
+设计用于避免状态抖动和快速回程误触发。
 
-默认确认次数均为 `2`。如果控制频率为 90 Hz 且每帧均执行，理论上至少需要约
-`22 ms` 的连续超限或连续恢复；实际时延还受 ROS 调度和反馈频率影响。
+> [!NOTE]
+> 本次快照中的恢复判断仍使用绝对偏差。如果阻碍解除后电流越过冻结基线，或者
+> 机器人在新的无阻碍负载下稳定，但电流没有回到旧基线附近，绝对偏差仍可能大于
+> 恢复阈值，导纳状态会继续保持开启。后续版本需要记录碰撞偏差方向，并在解除后
+> 进入禁止重复触发的基线重建阶段。
+
+当前碰撞确认次数为 `5`，恢复确认次数为 `5`。如果控制频率为 90 Hz 且每帧均
+执行，理论上两者分别需要约 `56 ms`；滑动平均窗口本身还会增加响应延迟，
+实际时延也受 ROS 调度和反馈频率影响。
 
 #### 力矩与位置调整
 
@@ -353,16 +376,17 @@ target_position = planned_position + position_diff
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
 | `collision_confirm_threshold` | `5` | 连续多少次超过电流阈值才确认碰撞 |
-| `recovery_confirm_threshold` | `2` | 连续多少次低于恢复阈值才确认恢复 |
-| `baseline_update_interval` | `5` | 每个关节累计多少次控制后更新一次基准电流 |
-| `filter_window_size` | `20` | 基准电流滑动平均窗口长度 |
+| `recovery_confirm_threshold` | `5` | 连续多少次满足恢复条件才确认恢复 |
+| `short_filter_window_size` | `5` | 碰撞响应短窗口长度 |
+| `long_filter_window_size` | `30` | 正常趋势与基线候选长窗口长度 |
+| `recovery_rearm_samples` | `30` | 恢复后暂不重新触发碰撞的样本数 |
+| `cold_start_ignore_duration_sec` | `1.0 s` | 每个关节首次处理时完全忽略电流的时长 |
 | `max_position_adjustment` | `30.0°` | 单次导纳位置调整的绝对值上限 |
 
 调参建议：
 
-- 电流噪声较大时，可以增大 `filter_window_size` 或确认次数，但响应会变慢。
-- 环境负载变化较慢但明显时，可以缩短 `baseline_update_interval`；过短可能让基准
-  跟随碰撞电流漂移。
+- 电流噪声较大时，可以增大短窗口或确认次数，但响应会变慢。
+- 长窗口过短会追随异常变化，过长会延迟基线恢复；当前数据建议从 `30` 点开始。
 - 应先根据正常运动电流波动设置碰撞和恢复阈值，再调节刚度、阻尼与最大调整量。
 - 修改斜率或截距后，应重新检查 `expected_torque` 和实际位置调整方向。
 - 腿部当前部分碰撞阈值为 `2 A`，明显高于上肢配置；调试时应结合实际电流曲线
@@ -371,9 +395,9 @@ target_position = planned_position + position_diff
 > [!NOTE]
 > `current_monitor` 节点直接记录 RDK 消息中的电流数值并以 mA 标注；导纳控制节点
 > 则会将同一反馈乘以 `0.001` 后按 A 参与碰撞和力矩计算。对照日志或 CSV 时应注意
-> 两个节点显示单位不同。图中的窗口平均电流和基线电流均以 mA 显示，其窗口长度
-> 和基线更新间隔与导纳控制器保持一致。电流偏差图在首次基线建立前留空，因为该
-> 阶段控制器同样不会执行阈值判断。
+> 两个节点显示单位不同。图中的短窗口、长窗口和基线均以 mA 显示，其窗口长度
+> 与导纳控制器保持一致。电流偏差图在长窗口填满前留空，因为该阶段控制器同样
+> 不会执行阈值判断。
 
 电流监控参数：
 

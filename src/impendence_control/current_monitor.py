@@ -33,12 +33,12 @@ import rclpy
 import time
 import os
 import csv
-import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from rclpy.node import Node
 from rdk_x5_multi_serial.msg import SerialData
 from impendence_control.admittance_calculate import (
     COMMON_PARAMS,
+    DEFAULT_CONFIG,
     JOINT_CONFIGS,
     JOINT_MOTOR_ROUTE,
 )
@@ -107,13 +107,17 @@ class CurrentMonitor(Node):
         self.frame_count = 0
         self.last_action_id = -1
         self.last_frame_index = -1
-        self.current_average_window = max(
+        self.short_average_window = max(
             1,
-            int(COMMON_PARAMS['filter_window_size']),
+            int(COMMON_PARAMS['short_filter_window_size']),
         )
-        self.baseline_update_interval = max(
+        self.long_average_window = max(
             1,
-            int(COMMON_PARAMS['baseline_update_interval']),
+            int(COMMON_PARAMS['long_filter_window_size']),
+        )
+        self.cold_start_ignore_duration = max(
+            0.0,
+            float(COMMON_PARAMS['cold_start_ignore_duration_sec']),
         )
         self.feedback_counts = defaultdict(int)
         self.unexpected_feedback_counts = defaultdict(int)
@@ -164,10 +168,13 @@ class CurrentMonitor(Node):
             f'  预期反馈路由: {expected_routes_text or "无有效路由"}'
         )
         self.get_logger().info(
-            f'  电流窗口平均: {self.current_average_window} 点'
+            f'  电流短窗口: {self.short_average_window} 点'
         )
         self.get_logger().info(
-            f'  基线更新间隔: {self.baseline_update_interval} 点'
+            f'  基线长窗口: {self.long_average_window} 点'
+        )
+        self.get_logger().info(
+            f'  冷启动电流屏蔽: {self.cold_start_ignore_duration:.2f} 秒'
         )
         self.get_logger().info('  CSV 保存方式: 停止时保存一次')
         self.get_logger().info('  图像导出方式: 停止时导出')
@@ -272,84 +279,193 @@ class CurrentMonitor(Node):
     # ==================== 绘图 ====================
 
     @staticmethod
-    def _moving_average(values: list, window_size: int) -> list:
-        """计算与 CurrentFilter 一致的滑动窗口平均，返回等长序列。"""
-        if not values:
-            return []
-
-        window_size = max(1, int(window_size))
-        moving_average = []
-        running_sum = 0.0
-
-        for index, value in enumerate(values):
-            running_sum += float(value)
-            if index >= window_size:
-                running_sum -= float(values[index - window_size])
-
-            sample_count = min(index + 1, window_size)
-            moving_average.append(running_sum / sample_count)
-
-        return moving_average
-
-    @staticmethod
-    def _baseline_series(window_currents: list, update_interval: int) -> list:
-        """按照导纳控制器的更新间隔重建阶梯状基线电流序列。"""
-        update_interval = max(1, int(update_interval))
-        baseline_currents = []
-        baseline_current = 0.0
-
-        for sample_index, window_current in enumerate(window_currents, start=1):
-            if sample_index % update_interval == 0:
-                baseline_current = float(window_current)
-            baseline_currents.append(baseline_current)
-
-        return baseline_currents
-
-    @staticmethod
-    def _admittance_enabled_series(
-        deviations: list,
+    def _reconstruct_control_state(
+        currents: list,
+        sample_times: list,
+        short_window_size: int,
+        long_window_size: int,
         collision_threshold: float,
         recovery_threshold: float,
         collision_confirm_count: int,
         recovery_confirm_count: int,
-    ) -> list:
-        """按照碰撞/恢复确认逻辑重建导纳是否启用的布尔序列。"""
+        recovery_rearm_samples: int,
+        cold_start_ignore_duration: float,
+    ) -> tuple:
+        """重建短/长窗口、锁存基线、电流偏差和导纳状态。"""
+        if len(currents) != len(sample_times):
+            raise ValueError('currents 和 sample_times 长度必须一致')
+
+        short_window_size = max(1, int(short_window_size))
+        long_window_size = max(1, int(long_window_size))
         collision_confirm_count = max(1, int(collision_confirm_count))
         recovery_confirm_count = max(1, int(recovery_confirm_count))
-        enabled = False
+        recovery_rearm_samples = max(0, int(recovery_rearm_samples))
+        cold_start_ignore_duration = max(
+            0.0,
+            float(cold_start_ignore_duration),
+        )
+        warmup_start_time = (
+            float(sample_times[0]) if sample_times else 0.0
+        )
+
+        short_buffer = deque()
+        long_buffer = deque()
+        short_sum = 0.0
+        long_sum = 0.0
+        short_currents = []
+        long_currents = []
+        baseline_currents = []
+        baseline_current = 0.0
+        baseline_initialized = False
+        baseline_frozen = False
+        sample_counter = 0
+
+        admittance_enabled = False
         collision_counter = 0
         recovery_counter = 0
+        rearm_counter = 0
+        deviations = []
         enabled_series = []
 
-        for deviation in deviations:
-            if math.isnan(deviation):
-                enabled = False
-                collision_counter = 0
-                recovery_counter = 0
+        for sample_index, current in enumerate(currents):
+            current = float(current)
+            sample_time = float(sample_times[sample_index])
+
+            if (
+                sample_time - warmup_start_time
+                < cold_start_ignore_duration
+            ):
+                short_currents.append(float('nan'))
+                long_currents.append(float('nan'))
+                baseline_currents.append(float('nan'))
+                deviations.append(float('nan'))
                 enabled_series.append(0)
                 continue
 
-            if enabled:
-                if deviation < recovery_threshold:
-                    recovery_counter += 1
-                    if recovery_counter >= recovery_confirm_count:
-                        enabled = False
+            short_buffer.append(current)
+            short_sum += current
+            if len(short_buffer) > short_window_size:
+                short_sum -= short_buffer.popleft()
+
+            filtered_current = short_sum / len(short_buffer)
+            short_currents.append(filtered_current)
+
+            if not baseline_initialized:
+                long_buffer.append(current)
+                long_sum += current
+                if len(long_buffer) > long_window_size:
+                    long_sum -= long_buffer.popleft()
+                baseline_candidate_current = (
+                    long_sum / len(long_buffer)
+                )
+                sample_counter += 1
+                if sample_counter >= long_window_size:
+                    baseline_current = baseline_candidate_current
+                    baseline_initialized = True
+                    sample_counter = 0
+                    deviation = 0.0
+                else:
+                    deviation = float('nan')
+                admittance_enabled = False
+                baseline_frozen = False
+                collision_counter = 0
+                recovery_counter = 0
+            else:
+                deviation = abs(filtered_current - baseline_current)
+
+                if rearm_counter > 0:
+                    long_buffer.append(current)
+                    long_sum += current
+                    if len(long_buffer) > long_window_size:
+                        long_sum -= long_buffer.popleft()
+                    baseline_candidate_current = (
+                        long_sum / len(long_buffer)
+                    )
+                    baseline_current = baseline_candidate_current
+                    deviation = abs(
+                        filtered_current - baseline_current
+                    )
+                    baseline_frozen = False
+                    admittance_enabled = False
+                    collision_counter = 0
+                    recovery_counter = 0
+                    rearm_counter -= 1
+                elif not baseline_frozen:
+                    if deviation > collision_threshold:
+                        baseline_frozen = True
+                        collision_counter = 1
+                        recovery_counter = 0
+                        if collision_counter >= collision_confirm_count:
+                            admittance_enabled = True
+                    else:
                         collision_counter = 0
                         recovery_counter = 0
+                        long_buffer.append(current)
+                        long_sum += current
+                        if len(long_buffer) > long_window_size:
+                            long_sum -= long_buffer.popleft()
+                        baseline_candidate_current = (
+                            long_sum / len(long_buffer)
+                        )
+                        baseline_current = baseline_candidate_current
+                        deviation = abs(
+                            filtered_current - baseline_current
+                        )
                 else:
-                    recovery_counter = 0
-            else:
-                if deviation > collision_threshold:
-                    collision_counter += 1
-                    if collision_counter >= collision_confirm_count:
-                        enabled = True
+                    if deviation < recovery_threshold:
+                        recovery_counter += 1
+                        if not admittance_enabled:
+                            collision_counter = 0
+
+                        if recovery_counter >= recovery_confirm_count:
+                            admittance_enabled = False
+                            baseline_frozen = False
+                            collision_counter = 0
+                            recovery_counter = 0
+                            rearm_counter = recovery_rearm_samples
+                    else:
                         recovery_counter = 0
-                else:
-                    collision_counter = 0
+                        if deviation > collision_threshold:
+                            if not admittance_enabled:
+                                collision_counter += 1
+                                if (
+                                    collision_counter
+                                    >= collision_confirm_count
+                                ):
+                                    admittance_enabled = True
+                        elif not admittance_enabled:
+                            collision_counter = 0
 
-            enabled_series.append(1 if enabled else 0)
+                    # 解冻的当前样本立即重新进入长窗口。
+                    if not baseline_frozen:
+                        long_buffer.append(current)
+                        long_sum += current
+                        if len(long_buffer) > long_window_size:
+                            long_sum -= long_buffer.popleft()
+                        baseline_candidate_current = (
+                            long_sum / len(long_buffer)
+                        )
+                        baseline_current = baseline_candidate_current
+                        deviation = abs(
+                            filtered_current - baseline_current
+                        )
 
-        return enabled_series
+            long_currents.append(baseline_candidate_current)
+            baseline_currents.append(
+                baseline_current
+                if baseline_initialized
+                else float('nan')
+            )
+            deviations.append(deviation)
+            enabled_series.append(1 if admittance_enabled else 0)
+
+        return (
+            short_currents,
+            long_currents,
+            baseline_currents,
+            deviations,
+            enabled_series,
+        )
 
     def plot_current_curves(self, save: bool = True, show: bool = False):
         """
@@ -407,14 +523,26 @@ class CurrentMonitor(Node):
             ax = axes[idx]
 
             times = [t - self.start_time for t, _ in records]
+            sample_times = [t for t, _ in records]
             currents = [c for _, c in records]
-            window_currents = self._moving_average(
+            config = JOINT_CONFIGS.get(joint_name, DEFAULT_CONFIG)
+            (
+                short_currents,
+                long_currents,
+                baseline_currents,
+                _,
+                _,
+            ) = self._reconstruct_control_state(
                 currents,
-                self.current_average_window,
-            )
-            baseline_currents = self._baseline_series(
-                window_currents,
-                self.baseline_update_interval,
+                sample_times,
+                self.short_average_window,
+                self.long_average_window,
+                float(config['current_threshold']) * 1000.0,
+                float(config['current_recovery_threshold']) * 1000.0,
+                COMMON_PARAMS['collision_confirm_threshold'],
+                COMMON_PARAMS['recovery_confirm_threshold'],
+                COMMON_PARAMS['recovery_rearm_samples'],
+                self.cold_start_ignore_duration,
             )
 
             ax.plot(
@@ -427,11 +555,19 @@ class CurrentMonitor(Node):
             )
             ax.plot(
                 times,
-                window_currents,
+                short_currents,
                 linewidth=1.4,
                 color='#FF9800',
                 alpha=0.95,
-                label=f'Window mean (N={self.current_average_window})',
+                label=f'Short mean (N={self.short_average_window})',
+            )
+            ax.plot(
+                times,
+                long_currents,
+                linewidth=1.2,
+                color='#00BCD4',
+                alpha=0.9,
+                label=f'Long mean (N={self.long_average_window})',
             )
             ax.plot(
                 times,
@@ -441,8 +577,16 @@ class CurrentMonitor(Node):
                 linestyle='--',
                 drawstyle='steps-post',
                 alpha=0.95,
-                label=f'Baseline (K={self.baseline_update_interval})',
+                label='Latched baseline',
             )
+            if self.cold_start_ignore_duration > 0:
+                ax.axvspan(
+                    times[0],
+                    times[0] + self.cold_start_ignore_duration,
+                    color='#9E9E9E',
+                    alpha=0.15,
+                    label='Cold start ignored',
+                )
 
             ax.set_title(joint_name, fontsize=10, fontweight='bold')
             ax.set_xlabel('Time (s)')
@@ -460,7 +604,8 @@ class CurrentMonitor(Node):
                 f'Max: {max_c:.4f}mA\n'
                 f'Min: {min_c:.4f}mA\n'
                 f'Mean: {mean_c:.4f}mA\n'
-                f'Last window mean: {window_currents[-1]:.4f}mA\n'
+                f'Last short mean: {short_currents[-1]:.4f}mA\n'
+                f'Last long mean: {long_currents[-1]:.4f}mA\n'
                 f'Last baseline: {baseline_currents[-1]:.4f}mA'
             )
 
@@ -505,7 +650,7 @@ class CurrentMonitor(Node):
         active_joints: dict,
         timestamp: str,
     ):
-        """绘制首次基线建立后的 |实际电流 - 基线电流| 总览图。"""
+        """绘制长窗口填满后的 |短窗口电流 - 锁存基线| 总览图。"""
         n_joints = len(active_joints)
         n_cols = min(3, n_joints)
         n_rows = (n_joints + n_cols - 1) // n_cols
@@ -529,88 +674,95 @@ class CurrentMonitor(Node):
         for idx, (joint_name, records) in enumerate(sorted(active_joints.items())):
             ax = axes[idx]
             times = [t - self.start_time for t, _ in records]
+            sample_times = [t for t, _ in records]
             currents = [c for _, c in records]
-            window_currents = self._moving_average(
+            config = JOINT_CONFIGS.get(joint_name, DEFAULT_CONFIG)
+            threshold_ma = float(config['current_threshold']) * 1000.0
+            recovery_threshold_ma = (
+                float(config['current_recovery_threshold']) * 1000.0
+            )
+            (
+                _,
+                _,
+                baseline_currents,
+                deviations,
+                admittance_enabled,
+            ) = self._reconstruct_control_state(
                 currents,
-                self.current_average_window,
+                sample_times,
+                self.short_average_window,
+                self.long_average_window,
+                threshold_ma,
+                recovery_threshold_ma,
+                COMMON_PARAMS['collision_confirm_threshold'],
+                COMMON_PARAMS['recovery_confirm_threshold'],
+                COMMON_PARAMS['recovery_rearm_samples'],
+                self.cold_start_ignore_duration,
             )
-            baseline_currents = self._baseline_series(
-                window_currents,
-                self.baseline_update_interval,
-            )
-            deviations = [
-                (
-                    abs(current - baseline)
-                    if sample_index >= self.baseline_update_interval
-                    else float('nan')
-                )
-                for sample_index, (current, baseline) in enumerate(
-                    zip(currents, baseline_currents),
-                    start=1,
-                )
-            ]
 
             ax.plot(
                 times,
                 deviations,
                 linewidth=1.2,
                 color='#9C27B0',
-                label='|Raw current - baseline|',
+                label='|Short mean - baseline|',
             )
 
-            config = JOINT_CONFIGS.get(joint_name)
-            if config is not None:
-                threshold_ma = float(config['current_threshold']) * 1000.0
-                ax.axhline(
-                    y=threshold_ma,
-                    color='#F44336',
-                    linestyle='--',
-                    linewidth=1.0,
-                    label=f'Collision threshold: {threshold_ma:.4f}mA',
-                )
-                recovery_threshold_ma = (
-                    float(config['current_recovery_threshold']) * 1000.0
-                )
-                ax.axhline(
-                    y=recovery_threshold_ma,
-                    color='#00BCD4',
-                    linestyle='-.',
-                    linewidth=1.0,
-                    label=(
-                        f'Recovery threshold: '
-                        f'{recovery_threshold_ma:.4f}mA'
-                    ),
-                )
-                admittance_enabled = self._admittance_enabled_series(
-                    deviations,
-                    threshold_ma,
-                    recovery_threshold_ma,
-                    COMMON_PARAMS['collision_confirm_threshold'],
-                    COMMON_PARAMS['recovery_confirm_threshold'],
+            ax.axhline(
+                y=threshold_ma,
+                color='#F44336',
+                linestyle='--',
+                linewidth=1.0,
+                label=f'Collision threshold: {threshold_ma:.4f}mA',
+            )
+            ax.axhline(
+                y=recovery_threshold_ma,
+                color='#00BCD4',
+                linestyle='-.',
+                linewidth=1.0,
+                label=(
+                    f'Recovery threshold: '
+                    f'{recovery_threshold_ma:.4f}mA'
+                ),
+            )
+
+            state_ax = ax.twinx()
+            state_ax.step(
+                times,
+                admittance_enabled,
+                where='post',
+                linewidth=1.2,
+                color='#795548',
+                label='Admittance active',
+            )
+            state_ax.set_ylabel(
+                'Admittance state',
+                color='#795548',
+            )
+            state_ax.tick_params(axis='y', labelcolor='#795548')
+            state_ax.set_ylim(-0.05, 1.05)
+            state_ax.set_yticks([0, 1])
+            state_ax.set_yticklabels(['Disabled', 'Enabled'])
+
+            if self.cold_start_ignore_duration > 0:
+                ax.axvspan(
+                    times[0],
+                    times[0] + self.cold_start_ignore_duration,
+                    color='#9E9E9E',
+                    alpha=0.15,
+                    label='Cold start ignored',
                 )
 
-                state_ax = ax.twinx()
-                state_ax.step(
-                    times,
-                    admittance_enabled,
-                    where='post',
-                    linewidth=1.2,
-                    color='#795548',
-                    label='Admittance active',
-                )
-                state_ax.set_ylabel(
-                    'Admittance state',
-                    color='#795548',
-                )
-                state_ax.tick_params(axis='y', labelcolor='#795548')
-                state_ax.set_ylim(-0.05, 1.05)
-                state_ax.set_yticks([0, 1])
-                state_ax.set_yticklabels(['Disabled', 'Enabled'])
-            else:
-                state_ax = None
-
-            if len(times) >= self.baseline_update_interval:
-                baseline_ready_time = times[self.baseline_update_interval - 1]
+            baseline_ready_index = next(
+                (
+                    index
+                    for index, deviation in enumerate(deviations)
+                    if deviation == deviation
+                ),
+                None,
+            )
+            if baseline_ready_index is not None:
+                baseline_ready_time = times[baseline_ready_index]
                 ax.axvline(
                     x=baseline_ready_time,
                     color='#4CAF50',
@@ -631,15 +783,14 @@ class CurrentMonitor(Node):
 
             ax.set_title(joint_name, fontsize=10, fontweight='bold')
             ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Absolute current deviation (mA)')
+            ax.set_ylabel('Short-window deviation (mA)')
             ax.grid(True, alpha=0.3, linestyle='--')
             lines, labels = ax.get_legend_handles_labels()
-            if state_ax is not None:
-                state_lines, state_labels = (
-                    state_ax.get_legend_handles_labels()
-                )
-                lines += state_lines
-                labels += state_labels
+            state_lines, state_labels = (
+                state_ax.get_legend_handles_labels()
+            )
+            lines += state_lines
+            labels += state_labels
             ax.legend(lines, labels, fontsize=7, loc='upper right')
 
         for idx in range(n_joints, len(axes)):

@@ -53,7 +53,7 @@ JOINT_CONFIGS = {
     },# 同轴
     'left_shoulder_roll': {
         'current_threshold': 0.06,
-        'current_recovery_threshold': 0.04,
+        'current_recovery_threshold': 0.03,
         'torque_slope_nm_per_a': 1.182535,
         'torque_intercept_nm': -0.025172,
         'expected_torque': 0.0004,
@@ -283,9 +283,11 @@ DEFAULT_CONFIG = {
 # 通用参数（所有关节共用）
 COMMON_PARAMS = {
     'collision_confirm_threshold': 5,      # 碰撞确认阈值
-    'recovery_confirm_threshold': 2,       # 恢复确认阈值
-    'baseline_update_interval': 5,       # 基准更新间隔
-    'filter_window_size': 20,              # 滤波窗口大小
+    'recovery_confirm_threshold': 5,       # 恢复确认阈值
+    'short_filter_window_size': 5,         # 碰撞响应短窗口
+    'long_filter_window_size': 30,         # 正常趋势长窗口
+    'recovery_rearm_samples': 30,          # 恢复后重新武装等待样本数
+    'cold_start_ignore_duration_sec': 1.0, # 冷启动电流屏蔽时间
     'max_position_adjustment': 30.0,       # 最大位置调整量 (度)
 }
 # ================================================================
@@ -369,6 +371,8 @@ class MotorAdmittanceState:
     """单个电机的导纳控制状态"""
     joint_id: str = ""
     current_current: float = 0.0
+    filtered_current: float = 0.0
+    current_deviation: float = 0.0
     measured_torque: float = 0.0
     torque_error: float = 0.0
     current_position: float = 0.0
@@ -377,10 +381,16 @@ class MotorAdmittanceState:
     target_position: float = 0.0
     planned_position: float = 0.0
     
-    current_filter: CurrentFilter = field(default_factory=lambda: CurrentFilter(20))
+    current_filter: CurrentFilter = field(default_factory=lambda: CurrentFilter(5))
+    baseline_filter: CurrentFilter = field(default_factory=lambda: CurrentFilter(30))
     baseline_current: float = 0.0
+    baseline_candidate_current: float = 0.0
     baseline_initialized: bool = False
+    baseline_frozen: bool = False
     sample_counter: int = 0
+    rearm_counter: int = 0
+    warmup_start_time: Optional[float] = None
+    warmup_completed: bool = False
     
     collision_detected: bool = False
     collision_counter: int = 0
@@ -409,7 +419,12 @@ class JointAdmittanceController(Node):
         """初始化关节（内部方法）"""
         if joint_id not in self.motor_states:
             state = MotorAdmittanceState(joint_id=joint_id)
-            state.current_filter = CurrentFilter(COMMON_PARAMS['filter_window_size'])
+            state.current_filter = CurrentFilter(
+                COMMON_PARAMS['short_filter_window_size']
+            )
+            state.baseline_filter = CurrentFilter(
+                COMMON_PARAMS['long_filter_window_size']
+            )
             self.motor_states[joint_id] = state
     
     def execute_admittance_control(self, joint_id: str, current: float, position: float) -> Tuple[bool, float]:
@@ -433,29 +448,91 @@ class JointAdmittanceController(Node):
         # 更新传感器数据
         state.current_current = current
         state.current_position = position
-        
+
+        monotonic_now = time.monotonic()
+        if state.warmup_start_time is None:
+            state.warmup_start_time = monotonic_now
+
+        warmup_elapsed = monotonic_now - state.warmup_start_time
+        warmup_duration = float(
+            COMMON_PARAMS['cold_start_ignore_duration_sec']
+        )
+        if warmup_elapsed < warmup_duration:
+            # 冷启动期间完全忽略电流：不更新窗口、不建立基线、
+            # 不检测碰撞，也不输出任何导纳位置调整。
+            state.filtered_current = 0.0
+            state.baseline_candidate_current = 0.0
+            state.current_deviation = 0.0
+            state.collision_detected = False
+            state.baseline_frozen = False
+            state.collision_counter = 0
+            state.recovery_counter = 0
+            state.target_position = state.planned_position
+            state.last_current = state.current_current
+            state.last_position = state.current_position
+            state.last_velocity = 0.0
+            state.last_update_time = time.time()
+            return False, state.planned_position
+
+        if not state.warmup_completed:
+            state.warmup_completed = True
+            self.get_logger().info(
+                f'关节 {joint_id}: 冷启动屏蔽结束，开始采集电流并建立基线'
+            )
+
+        # 短窗口始终接收电流样本，用于持续观察当前电流。
+        state.current_filter.add_sample(state.current_current)
+        state.filtered_current = state.current_filter.get_average()
+
         if not state.baseline_initialized:
-            # 首次基线建立阶段只累计正常启动样本，不进行碰撞判断。
-            state.current_filter.add_sample(state.current_current)
+            # 启动阶段填满长窗口，期间不进行碰撞判断。
+            state.baseline_filter.add_sample(state.current_current)
+            state.baseline_candidate_current = (
+                state.baseline_filter.get_average()
+            )
             state.sample_counter += 1
-            if state.sample_counter >= COMMON_PARAMS['baseline_update_interval']:
-                state.baseline_current = state.current_filter.get_average()
+            if (
+                state.sample_counter
+                >= COMMON_PARAMS['long_filter_window_size']
+            ):
+                state.baseline_current = state.baseline_candidate_current
                 state.baseline_initialized = True
                 state.sample_counter = 0
+            state.current_deviation = 0.0
             collision_detected = False
         else:
-            # 使用更新前的基线判断碰撞。疑似碰撞和已确认碰撞期间
-            # 冻结滤波窗口和基线，防止异常电流被吸收到后续基线中。
-            collision_detected = self._detect_collision(state, config)
-            if not collision_detected and state.collision_counter == 0:
-                state.current_filter.add_sample(state.current_current)
-                state.sample_counter += 1
-                if (
-                    state.sample_counter
-                    >= COMMON_PARAMS['baseline_update_interval']
-                ):
-                    state.baseline_current = state.current_filter.get_average()
-                    state.sample_counter = 0
+            if state.rearm_counter > 0:
+                # 恢复后的重新武装期：长窗口恢复采样，基线持续跟随，
+                # 暂不检测，等待长窗口重新适应正常电流。
+                state.baseline_filter.add_sample(state.current_current)
+                state.baseline_candidate_current = (
+                    state.baseline_filter.get_average()
+                )
+                state.baseline_current = state.baseline_candidate_current
+                state.current_deviation = abs(
+                    state.filtered_current - state.baseline_current
+                )
+                state.baseline_frozen = False
+                state.collision_detected = False
+                state.collision_counter = 0
+                state.recovery_counter = 0
+                state.rearm_counter -= 1
+                collision_detected = False
+            else:
+                # 先用上一时刻的长窗口基线判断。首次超阈值后，
+                # 长窗口和基线都立即冻结，直到满足恢复确认条件。
+                collision_detected = self._detect_collision(state, config)
+                if not state.baseline_frozen:
+                    state.baseline_filter.add_sample(state.current_current)
+                    state.baseline_candidate_current = (
+                        state.baseline_filter.get_average()
+                    )
+                    state.baseline_current = (
+                        state.baseline_candidate_current
+                    )
+                    state.current_deviation = abs(
+                        state.filtered_current - state.baseline_current
+                    )
         
         # 使用当前关节自己的标定参数，将电流 (A) 转换为力矩 (N·m)。
         state.measured_torque = current_to_torque(
@@ -492,6 +569,10 @@ class JointAdmittanceController(Node):
         self.get_logger().info(
             f'collision_detected: {collision_detected}  '
             f'current: {state.current_current:.6f} A  '
+            f'short_current: {state.filtered_current:.6f} A  '
+            f'long_current: {state.baseline_candidate_current:.6f} A  '
+            f'baseline: {state.baseline_current:.6f} A  '
+            f'baseline_frozen: {state.baseline_frozen}  '
             f'measured_torque: {state.measured_torque:.6f} N·m  '
             f'torque_error: {state.torque_error:.6f} N·m  '
             f'position_diff: {position_diff}'
@@ -513,36 +594,68 @@ class JointAdmittanceController(Node):
         """碰撞检测（内部方法）"""
         if not state.baseline_initialized:
             state.collision_detected = False
+            state.baseline_frozen = False
             state.collision_counter = 0
             state.recovery_counter = 0
             return False
 
-        current_deviation = abs(state.current_current - state.baseline_current)
-        
-        if state.collision_detected:
-            # 检测恢复
-            if current_deviation < config['current_recovery_threshold']:
-                state.recovery_counter += 1
-                if state.recovery_counter >= COMMON_PARAMS['recovery_confirm_threshold']:
-                    state.collision_detected = False
-                    state.collision_counter = 0
-                    state.recovery_counter = 0
-                    print(f"✓ 关节 {state.joint_id}: 碰撞恢复")
-                    return False
-            else:
-                state.recovery_counter = 0
-        else:
-            # 检测碰撞
+        current_deviation = abs(
+            state.filtered_current - state.baseline_current
+        )
+        state.current_deviation = current_deviation
+
+        if not state.baseline_frozen:
             if current_deviation > config['current_threshold']:
-                state.collision_counter += 1
-                if state.collision_counter >= COMMON_PARAMS['collision_confirm_threshold']:
+                # 第一次超阈值就冻结基线，从本次开始累计碰撞确认次数。
+                state.baseline_frozen = True
+                state.collision_counter = 1
+                state.recovery_counter = 0
+                if (
+                    state.collision_counter
+                    >= COMMON_PARAMS['collision_confirm_threshold']
+                ):
                     state.collision_detected = True
-                    state.recovery_counter = 0
-                    self.get_logger().info(f"⚠️  关节 {state.joint_id}: 检测到碰撞 (电流偏差: {current_deviation:.4f}A)")
-                    return True
             else:
                 state.collision_counter = 0
-        
+                state.recovery_counter = 0
+            return state.collision_detected
+
+        # 基线已冻结：短窗口继续计算，长窗口与绿色基线都保持不变。
+        if current_deviation < config['current_recovery_threshold']:
+            state.recovery_counter += 1
+            if not state.collision_detected:
+                state.collision_counter = 0
+
+            if (
+                state.recovery_counter
+                >= COMMON_PARAMS['recovery_confirm_threshold']
+            ):
+                state.collision_detected = False
+                state.baseline_frozen = False
+                state.collision_counter = 0
+                state.recovery_counter = 0
+                state.rearm_counter = COMMON_PARAMS['recovery_rearm_samples']
+                print(f"✓ 关节 {state.joint_id}: 基线解冻/碰撞恢复")
+                return False
+        else:
+            state.recovery_counter = 0
+
+            if current_deviation > config['current_threshold']:
+                if not state.collision_detected:
+                    state.collision_counter += 1
+                    if (
+                        state.collision_counter
+                        >= COMMON_PARAMS['collision_confirm_threshold']
+                    ):
+                        state.collision_detected = True
+                        self.get_logger().info(
+                            f"⚠️  关节 {state.joint_id}: 检测到碰撞 "
+                            f"(滤波电流偏差: {current_deviation:.4f}A)"
+                        )
+            elif not state.collision_detected:
+                # 未达到连续超限条件，但必须连续低于恢复阈值后才解冻。
+                state.collision_counter = 0
+
         return state.collision_detected
     
     def set_planned_position(self, joint_id: str, planned_pos: float):
@@ -568,14 +681,18 @@ class JointAdmittanceController(Node):
         return f"""
 ========== 关节 {joint_id} 诊断信息 ==========
 当前电流: {state.current_current:.4f} A
+短窗口电流: {state.filtered_current:.4f} A
+长窗口电流: {state.baseline_candidate_current:.4f} A
 标定力矩: {state.measured_torque:.6f} N·m
 期望力矩: {config['expected_torque']:.6f} N·m
 力矩误差: {state.torque_error:.6f} N·m
 当前位置: {state.current_position:.2f}°
 基准电流: {state.baseline_current:.4f} A
+冷启动屏蔽: {'已结束' if state.warmup_completed else '进行中'}
 基准状态: {'已建立' if state.baseline_initialized else '等待首次基线'}
+基准锁存: {'是' if state.baseline_frozen else '否'}
 电流偏差: {
-    f'{abs(state.current_current - state.baseline_current):.4f} A'
+    f'{state.current_deviation:.4f} A'
     if state.baseline_initialized
     else '等待首次基线，未启用'
 }
