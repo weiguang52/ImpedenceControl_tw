@@ -621,36 +621,7 @@ class CurrentMonitor(Node):
             ax.set_ylabel('Current (mA)')
             ax.grid(True, alpha=0.3, linestyle='--')
 
-            mean_c = sum(currents) / len(currents) if currents else 0
-            max_c = max(currents) if currents else 0
-            min_c = min(currents) if currents else 0
-
             ax.legend(fontsize=7, loc='upper right')
-
-            stats_text = (
-                f'Points: {len(records)}\n'
-                f'Max: {max_c:.4f}mA\n'
-                f'Min: {min_c:.4f}mA\n'
-                f'Mean: {mean_c:.4f}mA\n'
-                f'Last short mean: {short_currents[-1]:.4f}mA\n'
-                f'Last long mean: {long_currents[-1]:.4f}mA\n'
-                f'Last baseline: {baseline_currents[-1]:.4f}mA'
-            )
-
-            ax.text(
-                0.98,
-                0.97,
-                stats_text,
-                transform=ax.transAxes,
-                fontsize=7,
-                verticalalignment='top',
-                horizontalalignment='right',
-                bbox=dict(
-                    boxstyle='round',
-                    facecolor='wheat',
-                    alpha=0.5
-                )
-            )
 
         # 隐藏多余的子图
         for idx in range(n_joints, len(axes)):
