@@ -16,13 +16,14 @@ RDK_ACTION_ID = 1
 # 斜率和截距必须使用该关节所连接电机的独立标定结果。
 JOINT_CONFIGS = {
     'right_shoulder_roll': {
-        'current_threshold': 0.04,              # 电流突变阈值 (A)
-        'current_recovery_threshold': 0.02,    # 电流恢复阈值 (A)
-        'torque_slope_nm_per_a': 1.328629,
-        'torque_intercept_nm': -0.022189,
-        'expected_torque': 0.0004,                 # 期望力矩 (N·m)
-        'damping_coeff': 0.0001,                  # 阻尼系数 (B)
-        'stiffness_coeff': 0.07,               # 刚度系数 (K)
+        'current_threshold': 0.07,
+        'current_recovery_threshold': 0.03,
+        'torque_slope_nm_per_a': 1.182535,
+        'torque_intercept_nm': -0.025172,
+        'expected_torque': 0.04,
+        'admittance_direction': -1.0,
+        'damping_coeff': 0.001,
+        'stiffness_coeff': 2.0,
     },# 垂直轴
     'right_shoulder_yaw': {
         'current_threshold': 0.02,
@@ -34,13 +35,14 @@ JOINT_CONFIGS = {
         'stiffness_coeff': 0.07,
     },# 同轴
     'right_elbow_pitch': {
-        'current_threshold': 0.2,
-        'current_recovery_threshold': 0.1,
+        'current_threshold': 0.04,
+        'current_recovery_threshold': 0.02,
         'torque_slope_nm_per_a': 1.182535,
         'torque_intercept_nm': -0.025172,
-        'expected_torque': 0.0004,
-        'damping_coeff': 0.0001,
-        'stiffness_coeff': 0.04,
+        'expected_torque': 0.02,
+        'admittance_direction': -1.0,
+        'damping_coeff': 0.001,
+        'stiffness_coeff': 1.0,
     },# 垂直轴
     'right_wrist_yaw': {
         'current_threshold': 0.035,
@@ -71,13 +73,14 @@ JOINT_CONFIGS = {
         'stiffness_coeff': 0.07,
     },# 同轴
     'left_elbow_pitch': {
-        'current_threshold': 0.02,
-        'current_recovery_threshold': 0.01,
+        'current_threshold': 0.04,
+        'current_recovery_threshold': 0.02,
         'torque_slope_nm_per_a': 1.182535,
         'torque_intercept_nm': -0.025172,
-        'expected_torque': 0.0004,
-        'damping_coeff': 20.0,
-        'stiffness_coeff': 200.0,
+        'expected_torque': 0.04,
+        'admittance_direction': -1.0,
+        'damping_coeff': 0.001,
+        'stiffness_coeff': 2.0,
     },# 垂直轴
     'left_wrist_yaw': {
         'current_threshold': 0.035,
@@ -89,13 +92,14 @@ JOINT_CONFIGS = {
         'stiffness_coeff': 0.07,
     },# 同轴
     'right_shoulder_pitch': {
-        'current_threshold': 0.02,
-        'current_recovery_threshold': 0.01,
+        'current_threshold': 0.10,
+        'current_recovery_threshold': 0.05,
         'torque_slope_nm_per_a': 1.182535,
         'torque_intercept_nm': -0.025172,
-        'expected_torque': 0.0004,
-        'damping_coeff': 0.0001,
-        'stiffness_coeff': 0.07,
+        'expected_torque': 0.04,
+        'admittance_direction': -1.0,
+        'damping_coeff': 0.001,
+        'stiffness_coeff': 2.0,
     },# 垂直轴
     'left_shoulder_pitch': {
         'current_threshold': 0.02,
