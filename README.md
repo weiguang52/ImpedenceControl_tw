@@ -3,8 +3,9 @@
 ROS 2 Humble 机器人导纳控制包，包含三部分：
 
 - `admittance_control`：接收关节目标和电机反馈，执行导纳控制并向 RDK 串口桥发送电机命令。
-- `trajectory_planner`：生成单关节三次多项式轨迹并发布 `/joint_command`。
-- `current_monitor`：采集 `/serial_data` 电流反馈，退出时导出 CSV 和 PNG。
+- `trajectory_planner`：生成单关节单向或多次往返的三次多项式轨迹，并发布 `/joint_command`。
+- `current_monitor`：采集 `/serial_data` 电流/角度反馈和 `/joint_command`
+  规划角度，退出时导出 CSV 和 PNG。
 
 > [!WARNING]
 > 本项目会向真实电机发送位置命令。首次调试建议关闭导纳控制、选择单个关节、降低运动角度和频率，并确保急停可用。
@@ -39,7 +40,7 @@ source install/setup.bash
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=true \
-  -p debug_joint:="left_shoulder_roll"
+  -p debug_joint:="right_elbow_pitch"
 ```
 
 关闭导纳控制，仅验证轨迹和串口链路：
@@ -47,28 +48,48 @@ ros2 run impendence_control admittance_control --ros-args \
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=false \
-  -p debug_joint:="left_shoulder_roll"
+  -p debug_joint:="left_shoulder_pitch"
 ```
 
 ### 终端 2：启动轨迹规划节点
 
 ```bash
 ros2 run impendence_control trajectory_planner --ros-args \
-  -p joint_name:="left_shoulder_roll" \
-  -p start_pos:=200.0 \
-  -p end_pos:=320.0 \
+  -p joint_name:="left_shoulder_pitch" \
+  -p start_pos:=270.0 \
+  -p end_pos:=340.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
   -p auto_start:=true
 
 ros2 run impendence_control trajectory_planner --ros-args \
-  -p joint_name:="left_shoulder_roll" \
-  -p start_pos:=320.0 \
-  -p end_pos:=200.0 \
+  -p joint_name:="left_shoulder_pitch" \
+  -p start_pos:=130.0 \
+  -p end_pos:=0.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
   -p auto_start:=true
 ```
+
+开启往返测试（一次往返包含 `起始角度 → 结束角度` 和
+`结束角度 → 起始角度` 两个运动段）：
+
+```bash
+ros2 run impendence_control trajectory_planner --ros-args \
+  -p joint_name:="left_shoulder_pitch" \
+  -p start_pos:=270.0 \
+  -p end_pos:=340.0 \
+  -p duration:=8.0 \
+  -p frequency:=90.0 \
+  -p enable_round_trip:=true \
+  -p segment_wait_duration:=2.0 \
+  -p round_trip_count:=3 \
+  -p auto_start:=true
+```
+
+上例共执行 3 次往返，即 6 个运动段。相邻运动段之间在刚结束的角度保持
+`2.0` 秒后再继续，最后一段结束后不再等待。若不需要冷却，可设置
+`segment_wait_duration:=0.0`。
 
 轨迹规划参数：
 
@@ -81,6 +102,9 @@ ros2 run impendence_control trajectory_planner --ros-args \
 | `frequency` | 控制帧频率（Hz） | `50.0` |
 | `only_legs` | 是否只下发 `LEG_JOINT_NAMES` 中的关节 | `false` |
 | `auto_start` | 启动 3 秒后是否自动执行 | `true` |
+| `enable_round_trip` | 是否启用往返运动；关闭时只执行起点到终点 | `false` |
+| `segment_wait_duration` | 相邻运动段之间的冷却等待时间（秒），允许为 `0` | `0.0` |
+| `round_trip_count` | 往返次数；一次往返包含正向、反向两个运动段 | `1` |
 
 ### 终端 3：启动电流监控节点
 
@@ -89,7 +113,7 @@ ros2 run impendence_control trajectory_planner --ros-args \
 ```bash
 ros2 run impendence_control current_monitor --ros-args \
   -p output_dir:="./current_plots" \
-  -p target_joints:="left_shoulder_roll"
+  -p target_joints:="left_shoulder_pitch"
 ```
 
 多关节监控：
@@ -104,7 +128,8 @@ ros2 run impendence_control current_monitor --ros-args \
 
 - `current_data_<时间>.csv`：时间、电流和关节名称。
 - `current_plot_<时间>.png`：全部活动关节的电流总览，同时绘制原始电流、
-  5 点短窗口、30 点长窗口和锁存基线。
+  5 点短窗口、30 点长窗口和锁存基线；每个子图右侧角度轴同时绘制
+  `/joint_command` 规划角度与 `/serial_data` 反馈角度。
 - `current_deviation_<时间>.png`：全部活动关节的电流偏差总览，绘制首次基线
   建立后的 `|短窗口电流 - 锁存基线|`，并标出各关节的碰撞阈值与恢复阈值。
   每个子图右侧纵轴显示导纳状态：`0 / Disabled` 表示未启动，
@@ -195,7 +220,8 @@ trajectory_planner
 | `admittance_control` | 订阅 | `/serial_data` | `rdk_x5_multi_serial/msg/SerialData` | 角度、电流和追踪编号反馈 |
 | `admittance_control` | 发布 | `/serial_cmd` | `std_msgs/msg/String` | 按控制板拆分后的电机命令 |
 | `admittance_control` | 发布 | `/motor_angle_debug` | `std_msgs/msg/String` | 关节角到电机角的映射调试信息 |
-| `current_monitor` | 订阅 | `/serial_data` | `rdk_x5_multi_serial/msg/SerialData` | 电流采集与绘图 |
+| `current_monitor` | 订阅 | `/serial_data` | `rdk_x5_multi_serial/msg/SerialData` | 电流及反馈角度采集与绘图 |
+| `current_monitor` | 订阅 | `/joint_command` | `std_msgs/msg/String` | 规划角度采集与绘图 |
 
 ## 导纳控制节点参数
 
@@ -225,9 +251,9 @@ trajectory_planner
 - 每个关节必须分别填写自己的标定结果；控制器会根据 `joint_id` 读取对应参数。
 - `expected_torque` 仍是每个关节的期望力矩，单位为 N·m。
 - `current_threshold` 和 `current_recovery_threshold` 仍用于基于电流偏差的
-  碰撞检测，单位为 A；原有各关节阈值保持不变。
-- `damping_coeff`、`stiffness_coeff` 仍是各关节独立的导纳参数。本次只替换
-  标定模型，不凭电流标定结果推测新的阻尼和刚度。
+  碰撞检测，单位为 A，具体数值按关节独立配置。
+- `damping_coeff`、`stiffness_coeff` 是各关节独立的导纳参数，应以当前
+  `JOINT_CONFIGS` 和实机调试结果为准。
 - 当 `stiffness_coeff` 为 `0` 时，本次控制会跳过位置调整并输出错误日志，
   避免除零产生异常命令。
 
@@ -236,8 +262,18 @@ trajectory_planner
 
 | 斜率（N·m/A） | 截距（N·m） | 关节 |
 | ---: | ---: | --- |
-| `1.182535` | `-0.025172` | `right_elbow_pitch`、`left_shoulder_roll`、`left_elbow_pitch`、`right_shoulder_pitch`、`neck_pitch`、`right_hip_roll`、`right_knee_pitch`、`right_ankle_pitch`、`left_knee_pitch`、`left_ankle_pitch` |
-| `1.328629` | `-0.022189` | `right_shoulder_roll`、`right_shoulder_yaw`、`right_wrist_yaw`、`left_shoulder_yaw`、`left_wrist_yaw`、`left_shoulder_pitch`、`neck_roll`、`neck_yaw`、`waist_pitch`、`waist_roll`、`right_hip_pitch`、`left_hip_pitch`、`waist_yaw`、`right_hip_yaw`、`right_ankle_yaw`、`left_hip_roll`、`left_hip_yaw`、`left_ankle_yaw` |
+| `1.182535` | `-0.025172` | `right_shoulder_roll`、`right_elbow_pitch`、`left_shoulder_roll`、`left_elbow_pitch`、`right_shoulder_pitch`、`neck_pitch`、`right_hip_roll`、`right_knee_pitch`、`right_ankle_pitch`、`left_knee_pitch`、`left_ankle_pitch` |
+| `1.328629` | `-0.022189` | `right_shoulder_yaw`、`right_wrist_yaw`、`left_shoulder_yaw`、`left_wrist_yaw`、`left_shoulder_pitch`、`neck_roll`、`neck_yaw`、`waist_pitch`、`waist_roll`、`right_hip_pitch`、`left_hip_pitch`、`waist_yaw`、`right_hip_yaw`、`right_ankle_yaw`、`left_hip_roll`、`left_hip_yaw`、`left_ankle_yaw` |
+
+当前已单独实机调整的关节参数如下，运行时仍以
+`src/impendence_control/admittance_calculate.py` 中的配置为准：
+
+| 关节 | 碰撞阈值（A） | 恢复阈值（A） | 期望力矩（N·m） | 导纳方向 | 阻尼 | 刚度 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `right_shoulder_roll` | `0.07` | `0.03` | `0.04` | `-1.0` | `0.001` | `2.0` |
+| `right_elbow_pitch` | `0.04` | `0.02` | `0.02` | `-1.0` | `0.001` | `1.0` |
+| `left_elbow_pitch` | `0.04` | `0.02` | `0.04` | `-1.0` | `0.001` | `2.0` |
+| `right_shoulder_pitch` | `0.10` | `0.05` | `0.04` | `-1.0` | `0.001` | `2.0` |
 
 ### 电流处理、碰撞检测与导纳计算
 
@@ -432,6 +468,7 @@ target_position =
 | 参数 | 含义 | 默认值 |
 | --- | --- | --- |
 | `motor_feedback_topic` | RDK 电机反馈话题 | `/serial_data` |
+| `joint_command_topic` | 用于记录规划角度的关节命令话题 | `/joint_command` |
 | `output_dir` | CSV 和图片输出目录 | `./current_plots` |
 | `target_joints` | 逗号分隔的关节名；空字符串表示全部 | `""` |
 

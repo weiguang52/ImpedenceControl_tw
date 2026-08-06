@@ -3,10 +3,11 @@
 电流监控与绘图节点 (Current Monitor Node)
 
 功能：
-  订阅 /serial_data 话题，记录每个关节的时间-电流数据；
+  订阅 /serial_data 和 /joint_command 话题，记录每个关节的电流、
+  反馈角度和规划角度数据；
   在节点关闭时（Ctrl+C）自动：
     1. 导出 CSV 数据
-    2. 绘制时间-电流图像并导出为 PNG 文件
+    2. 绘制时间-电流/角度图像并导出为 PNG 文件
 
 使用方式：
   监控全部关节：
@@ -33,15 +34,32 @@ import rclpy
 import time
 import os
 import csv
+import json
 from collections import defaultdict, deque
 from rclpy.node import Node
 from rdk_x5_multi_serial.msg import SerialData
+from std_msgs.msg import String
 from impendence_control.admittance_calculate import (
     COMMON_PARAMS,
     DEFAULT_CONFIG,
     JOINT_CONFIGS,
     JOINT_MOTOR_ROUTE,
 )
+
+# /joint_command 中 joint_angles 的固定顺序，与 trajectory_planner 和
+# admittance_calculate 保持一致。
+JOINT_NAMES = [
+    'left_hip_pitch', 'left_hip_roll', 'left_hip_yaw',
+    'left_knee_pitch', 'left_ankle_yaw', 'left_ankle_pitch',
+    'right_hip_pitch', 'right_hip_roll', 'right_hip_yaw',
+    'right_knee_pitch', 'right_ankle_yaw', 'right_ankle_pitch',
+    'waist_yaw', 'waist_pitch', 'waist_roll',
+    'left_shoulder_pitch', 'left_shoulder_roll', 'left_shoulder_yaw',
+    'left_elbow_pitch', 'left_wrist_yaw',
+    'right_shoulder_pitch', 'right_shoulder_roll', 'right_shoulder_yaw',
+    'right_elbow_pitch', 'right_wrist_yaw',
+    'neck_yaw', 'neck_roll', 'neck_pitch',
+]
 
 # 尝试导入 matplotlib；若不可用则给出清晰提示
 try:
@@ -67,6 +85,7 @@ class CurrentMonitor(Node):
 
         # ========== 参数 ==========
         self.declare_parameter('motor_feedback_topic', '/serial_data')
+        self.declare_parameter('joint_command_topic', '/joint_command')
         self.declare_parameter('output_dir', './current_plots')
 
         # 注意：
@@ -76,6 +95,9 @@ class CurrentMonitor(Node):
         self.declare_parameter('target_joints', '')
 
         self.MOTOR_FEEDBACK_TOPIC = self.get_parameter('motor_feedback_topic').value
+        self.JOINT_COMMAND_TOPIC = self.get_parameter(
+            'joint_command_topic'
+        ).value
         self.output_dir = self.get_parameter('output_dir').value
 
         target_joints_param = self.get_parameter('target_joints').value
@@ -103,6 +125,10 @@ class CurrentMonitor(Node):
         # ========== 数据存储 ==========
         # data[joint_name] = [(timestamp, current), ...]
         self.data = defaultdict(list)
+        # planned_angle_data / feedback_angle_data:
+        #   joint_name = [(timestamp, angle_degrees), ...]
+        self.planned_angle_data = defaultdict(list)
+        self.feedback_angle_data = defaultdict(list)
         self.start_time = time.time()
         self.frame_count = 0
         self.last_action_id = -1
@@ -149,10 +175,21 @@ class CurrentMonitor(Node):
             self.motor_feedback_callback,
             10
         )
+        self.joint_command_sub = self.create_subscription(
+            String,
+            self.JOINT_COMMAND_TOPIC,
+            self.joint_command_callback,
+            10,
+        )
 
         self.get_logger().info('=' * 60)
         self.get_logger().info('📊 电流监控节点已启动')
-        self.get_logger().info(f'  订阅话题: {self.MOTOR_FEEDBACK_TOPIC}')
+        self.get_logger().info(
+            f'  电机反馈话题: {self.MOTOR_FEEDBACK_TOPIC}'
+        )
+        self.get_logger().info(
+            f'  规划角度话题: {self.JOINT_COMMAND_TOPIC}'
+        )
         self.get_logger().info(f'  输出目录: {os.path.abspath(self.output_dir)}')
 
         if self.target_joints:
@@ -182,8 +219,30 @@ class CurrentMonitor(Node):
 
     # ==================== 数据采集 ====================
 
+    def joint_command_callback(self, msg: String):
+        """记录 /joint_command 中每个受监控关节的规划角度。"""
+        try:
+            command_data = json.loads(msg.data)
+            joint_angles = command_data.get('joint_angles')
+            if not isinstance(joint_angles, (list, tuple)):
+                return
+
+            now = time.time()
+            for joint_index, joint_name in enumerate(JOINT_NAMES):
+                if self.target_joints and joint_name not in self.target_joints:
+                    continue
+                if joint_index >= len(joint_angles):
+                    break
+
+                self.planned_angle_data[joint_name].append(
+                    (now, float(joint_angles[joint_index]))
+                )
+
+        except Exception as e:
+            self.get_logger().error(f'处理规划角度数据失败: {e}')
+
     def motor_feedback_callback(self, msg: SerialData):
-        """接收新版 /serial_data 反馈，记录电流数据。"""
+        """接收新版 /serial_data 反馈，记录电流和反馈角度。"""
         try:
             serial_id = int(msg.port)
             board_id = int(msg.board_id)
@@ -196,6 +255,7 @@ class CurrentMonitor(Node):
                 self.unexpected_feedback_counts[route_key] += 1
 
             currents = [float(x) for x in msg.currents]
+            angles = [float(x) for x in msg.angles]
             action_id = int(msg.action_id)
             frame_index = int(msg.frame_index)
             self.last_action_id = action_id
@@ -203,7 +263,6 @@ class CurrentMonitor(Node):
 
             if not currents:
                 self.empty_current_feedback_counts[route_key] += 1
-                return
 
             now = time.time()
 
@@ -219,11 +278,16 @@ class CurrentMonitor(Node):
                     continue
 
                 motor_index = int(route['motor_index'])
-                if len(currents) <= motor_index:
-                    continue
 
-                current_val = currents[motor_index]
-                self.data[joint_name].append((now, current_val))
+                if len(currents) > motor_index:
+                    current_val = currents[motor_index]
+                    self.data[joint_name].append((now, current_val))
+
+                if len(angles) > motor_index:
+                    feedback_angle = angles[motor_index]
+                    self.feedback_angle_data[joint_name].append(
+                        (now, feedback_angle)
+                    )
 
         except Exception as e:
             self.feedback_parse_error_count += 1
@@ -535,7 +599,7 @@ class CurrentMonitor(Node):
         )
 
         fig.suptitle(
-            f'Joint Current vs Time\n'
+            f'Joint Current and Angle vs Time\n'
             f'(Recorded: {time.strftime("%Y-%m-%d %H:%M:%S")})',
             fontsize=14,
             fontweight='bold'
@@ -553,6 +617,14 @@ class CurrentMonitor(Node):
             times = [t - self.start_time for t, _ in records]
             sample_times = [t for t, _ in records]
             currents = [c for _, c in records]
+            planned_angle_records = self.planned_angle_data.get(
+                joint_name,
+                [],
+            )
+            feedback_angle_records = self.feedback_angle_data.get(
+                joint_name,
+                [],
+            )
             config = JOINT_CONFIGS.get(joint_name, DEFAULT_CONFIG)
             (
                 short_currents,
@@ -621,7 +693,53 @@ class CurrentMonitor(Node):
             ax.set_ylabel('Current (mA)')
             ax.grid(True, alpha=0.3, linestyle='--')
 
-            ax.legend(fontsize=7, loc='upper right')
+            angle_ax = ax.twinx()
+            if planned_angle_records:
+                angle_ax.plot(
+                    [
+                        timestamp - self.start_time
+                        for timestamp, _ in planned_angle_records
+                    ],
+                    [
+                        angle
+                        for _, angle in planned_angle_records
+                    ],
+                    linewidth=1.5,
+                    color='#E91E63',
+                    linestyle='--',
+                    alpha=0.95,
+                    label='Planned angle',
+                )
+            if feedback_angle_records:
+                angle_ax.plot(
+                    [
+                        timestamp - self.start_time
+                        for timestamp, _ in feedback_angle_records
+                    ],
+                    [
+                        angle
+                        for _, angle in feedback_angle_records
+                    ],
+                    linewidth=1.2,
+                    color='#673AB7',
+                    alpha=0.9,
+                    label='Feedback angle',
+                )
+
+            angle_ax.set_ylabel('Angle (°)', color='#5E35B1')
+            angle_ax.tick_params(axis='y', labelcolor='#5E35B1')
+            angle_ax.grid(False)
+
+            current_lines, current_labels = ax.get_legend_handles_labels()
+            angle_lines, angle_labels = (
+                angle_ax.get_legend_handles_labels()
+            )
+            ax.legend(
+                current_lines + angle_lines,
+                current_labels + angle_labels,
+                fontsize=7,
+                loc='upper right',
+            )
 
         # 隐藏多余的子图
         for idx in range(n_joints, len(axes)):
