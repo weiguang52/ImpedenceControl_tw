@@ -48,7 +48,7 @@ ros2 run impendence_control admittance_control --ros-args \
 ```bash
 ros2 run impendence_control admittance_control --ros-args \
   -p enable_admittance:=false \
-  -p debug_joint:="left_shoulder_pitch"
+  -p debug_joint:="left_elbow_pitch"
 ```
 
 ### 终端 2：启动轨迹规划节点
@@ -76,9 +76,9 @@ ros2 run impendence_control trajectory_planner --ros-args \
 
 ```bash
 ros2 run impendence_control trajectory_planner --ros-args \
-  -p joint_name:="left_shoulder_pitch" \
-  -p start_pos:=270.0 \
-  -p end_pos:=340.0 \
+  -p joint_name:="left_elbow_pitch" \
+  -p start_pos:=360.0 \
+  -p end_pos:=230.0 \
   -p duration:=8.0 \
   -p frequency:=90.0 \
   -p enable_round_trip:=true \
@@ -88,8 +88,40 @@ ros2 run impendence_control trajectory_planner --ros-args \
 ```
 
 上例共执行 3 次往返，即 6 个运动段。相邻运动段之间在刚结束的角度保持
-`2.0` 秒后再继续，最后一段结束后不再等待。若不需要冷却，可设置
+`0.5` 秒后再继续，最后一段结束后不再等待。若不需要冷却，可设置
 `segment_wait_duration:=0.0`。
+
+单向运动还可以在指定角度暂停。例如在 `0° → 360°` 运动经过 `160°`
+时硬中断 1 秒：
+
+```bash
+ros2 run impendence_control trajectory_planner --ros-args \
+  -p joint_name:="left_elbow_pitch" \
+  -p start_pos:=360.0 \
+  -p end_pos:=230.0 \
+  -p duration:=8.0 \
+  -p frequency:=90.0 \
+  -p enable_motion_interrupt:=true \
+  -p interrupt_position:=250.0 \
+  -p interrupt_duration:=1.0 \
+  -p interrupt_mode:="hard" \
+  -p auto_start:=true
+```
+
+中断模式：
+
+- `hard`：先为 `start_pos → end_pos` 生成一条完整三次轨迹，在
+  `interrupt_position` 对应的原轨迹时刻冻结并保持最后一条位置命令；等待结束后
+  从该轨迹时刻继续。因此中断点的原规划速度通常不为零。
+- `soft`：提前将轨迹拆成 `start_pos → interrupt_position` 和
+  `interrupt_position → end_pos` 两段三次轨迹。`duration` 按两段角度行程比例
+  分配，第一段终点和第二段起点速度均为零，两段之间等待
+  `interrupt_duration`。
+
+两种模式下，`duration` 都只表示运动时间，不包含中断等待时间。例如
+`duration:=8.0`、`interrupt_duration:=1.0` 时，总执行时间约为 9 秒。
+指定位置中断仅用于单向模式，不能与 `enable_round_trip:=true` 同时开启。
+`interrupt_position` 必须严格位于起始角度和结束角度之间，正向和反向运动均支持。
 
 轨迹规划参数：
 
@@ -105,6 +137,10 @@ ros2 run impendence_control trajectory_planner --ros-args \
 | `enable_round_trip` | 是否启用往返运动；关闭时只执行起点到终点 | `false` |
 | `segment_wait_duration` | 相邻运动段之间的冷却等待时间（秒），允许为 `0` | `0.0` |
 | `round_trip_count` | 往返次数；一次往返包含正向、反向两个运动段 | `1` |
+| `enable_motion_interrupt` | 是否开启单向轨迹指定位置中断 | `false` |
+| `interrupt_position` | 中断角度（°），必须严格位于起点和终点之间 | `0.0` |
+| `interrupt_duration` | 中断保持时间（秒），允许为 `0` | `1.0` |
+| `interrupt_mode` | 中断方式：`hard` 或 `soft` | `hard` |
 
 ### 终端 3：启动电流监控节点
 
@@ -113,7 +149,7 @@ ros2 run impendence_control trajectory_planner --ros-args \
 ```bash
 ros2 run impendence_control current_monitor --ros-args \
   -p output_dir:="./current_plots" \
-  -p target_joints:="left_shoulder_pitch"
+  -p target_joints:="left_elbow_pitch"
 ```
 
 多关节监控：

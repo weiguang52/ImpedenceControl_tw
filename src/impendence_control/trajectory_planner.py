@@ -7,6 +7,7 @@
   将插值后的控制帧以 /joint_command 话题发送给导纳控制节点 (admittance_calculate.py)。
   可选开启往返模式，按相同的起止角度重复执行正向和反向轨迹，并在相邻运动段
   之间等待指定的冷却时间。
+  单向模式下还可在指定角度执行硬中断或软中断，并在暂停后继续完成剩余轨迹。
 
 三次插值（Cubic Spline）保证：
   - 位置连续
@@ -59,6 +60,22 @@ class TrajectoryPlanner(Node):
             'round_trip_count',
             1,
         )  # 往返次数；一次往返包含正向和反向两段
+        self.declare_parameter(
+            'enable_motion_interrupt',
+            False,
+        )  # 是否启用单向轨迹指定位置中断
+        self.declare_parameter(
+            'interrupt_position',
+            0.0,
+        )  # 中断角度 (度)
+        self.declare_parameter(
+            'interrupt_duration',
+            1.0,
+        )  # 中断保持时间 (秒)
+        self.declare_parameter(
+            'interrupt_mode',
+            'hard',
+        )  # hard: 原轨迹冻结；soft: 拆成两段零速三次轨迹
 
         self.joint_name = self.get_parameter('joint_name').value
         self.start_pos = float(self.get_parameter('start_pos').value)
@@ -76,6 +93,18 @@ class TrajectoryPlanner(Node):
         self.round_trip_count = int(
             self.get_parameter('round_trip_count').value
         )
+        self.enable_motion_interrupt = bool(
+            self.get_parameter('enable_motion_interrupt').value
+        )
+        self.interrupt_position = float(
+            self.get_parameter('interrupt_position').value
+        )
+        self.interrupt_duration = float(
+            self.get_parameter('interrupt_duration').value
+        )
+        self.interrupt_mode = str(
+            self.get_parameter('interrupt_mode').value
+        ).strip().lower()
 
         # ========== 关节名称列表（与 admittance_calculate.py 保持一致，共 28 个） ==========
         self.joint_names = [
@@ -104,8 +133,14 @@ class TrajectoryPlanner(Node):
         self.total_segments = 1
         self.current_segment_start = self.start_pos
         self.current_segment_end = self.end_pos
+        self.current_segment_duration = self.duration
         self.waiting_between_segments = False
         self.segment_wait_start_time = 0.0
+        self.current_wait_duration = 0.0
+        self.hard_interrupt_active = False
+        self.hard_interrupt_handled = False
+        self.hard_interrupt_start_time = 0.0
+        self.hard_interrupt_trajectory_time = 0.0
 
         # ========== 发布者 ==========
         self.joint_command_pub = self.create_publisher(
@@ -130,6 +165,16 @@ class TrajectoryPlanner(Node):
             self.get_logger().info(f'  往返次数: {self.round_trip_count}')
             self.get_logger().info(
                 f'  段间等待: {self.segment_wait_duration:.2f} s'
+            )
+        self.get_logger().info(
+            f'  指定位置中断: '
+            f'{"启用" if self.enable_motion_interrupt else "禁用"}'
+        )
+        if self.enable_motion_interrupt:
+            self.get_logger().info(
+                f'  中断配置: {self.interrupt_position:.2f}°，'
+                f'{self.interrupt_duration:.2f}s，'
+                f'{self.interrupt_mode}'
             )
         self.get_logger().info('=' * 60)
 
@@ -205,21 +250,55 @@ class TrajectoryPlanner(Node):
         if self.frequency <= 0.0:
             self.get_logger().error('frequency 必须大于 0')
             return
-        if self.segment_wait_duration < 0.0:
+        if self.enable_round_trip and self.segment_wait_duration < 0.0:
             self.get_logger().error('segment_wait_duration 不能小于 0')
             return
-        if self.round_trip_count < 1:
+        if self.enable_round_trip and self.round_trip_count < 1:
             self.get_logger().error('round_trip_count 必须大于或等于 1')
             return
+        if self.enable_round_trip and self.enable_motion_interrupt:
+            self.get_logger().error(
+                'enable_motion_interrupt 仅支持单向运动，'
+                '不能与 enable_round_trip 同时启用'
+            )
+            return
+        if self.enable_motion_interrupt:
+            if self.interrupt_mode not in ('hard', 'soft'):
+                self.get_logger().error(
+                    'interrupt_mode 只能设置为 "hard" 或 "soft"'
+                )
+                return
+            if self.interrupt_duration < 0.0:
+                self.get_logger().error('interrupt_duration 不能小于 0')
+                return
+            lower_bound = min(self.start_pos, self.end_pos)
+            upper_bound = max(self.start_pos, self.end_pos)
+            if not (
+                lower_bound
+                < self.interrupt_position
+                < upper_bound
+            ):
+                self.get_logger().error(
+                    'interrupt_position 必须严格位于 start_pos 和 '
+                    'end_pos 之间'
+                )
+                return
 
-        self.total_segments = (
-            self.round_trip_count * 2
-            if self.enable_round_trip
-            else 1
-        )
+        if (
+            self.enable_motion_interrupt
+            and self.interrupt_mode == 'soft'
+        ):
+            self.total_segments = 2
+        elif self.enable_round_trip:
+            self.total_segments = self.round_trip_count * 2
+        else:
+            self.total_segments = 1
         self.current_segment_index = 0
         self.frame_count = 0
         self.waiting_between_segments = False
+        self.current_wait_duration = 0.0
+        self.hard_interrupt_active = False
+        self.hard_interrupt_handled = False
         self.trajectory_active = True
 
         self._start_current_segment()
@@ -236,12 +315,85 @@ class TrajectoryPlanner(Node):
                 f'🔁 往返测试开始：共 {self.round_trip_count} 次往返、'
                 f'{self.total_segments} 个运动段'
             )
+        elif self.enable_motion_interrupt:
+            self.get_logger().info(
+                f'⏸️  单向{self.interrupt_mode}中断测试开始：'
+                f'{self.interrupt_position:.2f}° 处暂停 '
+                f'{self.interrupt_duration:.2f}s'
+            )
 
     def _get_segment_bounds(self, segment_index: int):
-        """根据段序号返回本段起止角度；偶数正向，奇数反向。"""
+        """返回当前运动段的起止角度。"""
+        if (
+            self.enable_motion_interrupt
+            and self.interrupt_mode == 'soft'
+        ):
+            if segment_index == 0:
+                return self.start_pos, self.interrupt_position
+            return self.interrupt_position, self.end_pos
+
         if segment_index % 2 == 0:
             return self.start_pos, self.end_pos
         return self.end_pos, self.start_pos
+
+    def _get_segment_duration(self, segment_index: int) -> float:
+        """返回当前运动段时长；软中断按两段行程比例分配总运动时间。"""
+        if not (
+            self.enable_motion_interrupt
+            and self.interrupt_mode == 'soft'
+        ):
+            return self.duration
+
+        full_distance = abs(self.end_pos - self.start_pos)
+        first_distance = abs(
+            self.interrupt_position - self.start_pos
+        )
+        first_duration = self.duration * first_distance / full_distance
+        if segment_index == 0:
+            return first_duration
+        return self.duration - first_duration
+
+    def _get_wait_duration_after_segment(
+        self,
+        completed_segment_index: int,
+    ) -> float:
+        """返回完成指定运动段后、开始下一段前的等待时长。"""
+        if (
+            self.enable_motion_interrupt
+            and self.interrupt_mode == 'soft'
+            and completed_segment_index == 0
+        ):
+            return self.interrupt_duration
+        if self.enable_round_trip:
+            return self.segment_wait_duration
+        return 0.0
+
+    def _find_cubic_time_for_position(
+        self,
+        coeffs,
+        target_position: float,
+        duration: float,
+    ) -> float:
+        """用二分法求单调三次轨迹到达指定角度的轨迹时间。"""
+        start_position = self.evaluate_cubic(coeffs, 0.0)
+        increasing = target_position >= start_position
+        lower_time = 0.0
+        upper_time = duration
+
+        for _ in range(60):
+            middle_time = (lower_time + upper_time) * 0.5
+            middle_position = self.evaluate_cubic(
+                coeffs,
+                middle_time,
+            )
+            if (
+                middle_position < target_position
+            ) == increasing:
+                lower_time = middle_time
+            else:
+                upper_time = middle_time
+
+        return (lower_time + upper_time) * 0.5
 
     def _start_current_segment(self):
         """准备并启动 current_segment_index 指向的运动段。"""
@@ -249,12 +401,27 @@ class TrajectoryPlanner(Node):
             self.current_segment_start,
             self.current_segment_end,
         ) = self._get_segment_bounds(self.current_segment_index)
+        self.current_segment_duration = self._get_segment_duration(
+            self.current_segment_index
+        )
 
         self.trajectory_coeffs = self.compute_cubic_coefficients(
             self.current_segment_start,
             self.current_segment_end,
-            self.duration,
+            self.current_segment_duration,
         )
+        if (
+            self.enable_motion_interrupt
+            and self.interrupt_mode == 'hard'
+            and not self.hard_interrupt_handled
+        ):
+            self.hard_interrupt_trajectory_time = (
+                self._find_cubic_time_for_position(
+                    self.trajectory_coeffs,
+                    self.interrupt_position,
+                    self.current_segment_duration,
+                )
+            )
         a0, a1, a2, a3 = self.trajectory_coeffs
         self.get_logger().info(
             f'📐 三次多项式系数: '
@@ -270,7 +437,8 @@ class TrajectoryPlanner(Node):
             f'{self.joint_name}: '
             f'{self.current_segment_start:.2f}° → '
             f'{self.current_segment_end:.2f}°, '
-            f'时长 {self.duration:.2f}s, 频率 {self.frequency:.1f}Hz'
+            f'时长 {self.current_segment_duration:.2f}s, '
+            f'频率 {self.frequency:.1f}Hz'
         )
 
     def publish_trajectory_frame(self):
@@ -280,13 +448,30 @@ class TrajectoryPlanner(Node):
 
         now = time.monotonic()
 
+        if self.hard_interrupt_active:
+            interrupt_elapsed = now - self.hard_interrupt_start_time
+            if interrupt_elapsed < self.interrupt_duration:
+                return
+
+            self.hard_interrupt_active = False
+            self.hard_interrupt_handled = True
+            # 冻结的是原轨迹时间；恢复时从中断角度对应的原轨迹时刻继续。
+            self.trajectory_start_time = (
+                now - self.hard_interrupt_trajectory_time
+            )
+            self.get_logger().info(
+                f'▶️  硬中断结束，从 {self.interrupt_position:.2f}° '
+                f'继续原轨迹'
+            )
+            return
+
         if self.waiting_between_segments:
             wait_elapsed = now - self.segment_wait_start_time
-            if wait_elapsed < self.segment_wait_duration:
+            if wait_elapsed < self.current_wait_duration:
                 return
 
             self.get_logger().info(
-                f'⏱️  冷却等待完成，开始第 '
+                f'⏱️  等待完成，开始第 '
                 f'{self.current_segment_index + 1}/{self.total_segments} 段'
             )
             self._start_current_segment()
@@ -294,8 +479,31 @@ class TrajectoryPlanner(Node):
 
         elapsed = now - self.trajectory_start_time
 
+        if (
+            self.enable_motion_interrupt
+            and self.interrupt_mode == 'hard'
+            and not self.hard_interrupt_handled
+            and elapsed >= self.hard_interrupt_trajectory_time
+        ):
+            interrupt_velocity = self.evaluate_cubic_velocity(
+                self.trajectory_coeffs,
+                self.hard_interrupt_trajectory_time,
+            )
+            self._send_joint_command(self.interrupt_position)
+            self.frame_count += 1
+            self.segment_frame_count += 1
+            self.hard_interrupt_active = True
+            self.hard_interrupt_start_time = now
+            self.get_logger().info(
+                f'⏸️  硬中断开始：位置 '
+                f'{self.interrupt_position:.2f}°，'
+                f'原轨迹速度 {interrupt_velocity:.3f}°/s，'
+                f'暂停 {self.interrupt_duration:.2f}s'
+            )
+            return
+
         # 轨迹结束判定
-        if elapsed >= self.duration:
+        if elapsed >= self.current_segment_duration:
             # 发送最终位置
             self._send_joint_command(self.current_segment_end, final=True)
             self.frame_count += 1
@@ -307,6 +515,7 @@ class TrajectoryPlanner(Node):
                 f'实际耗时 {elapsed:.3f}s'
             )
 
+            completed_segment_index = self.current_segment_index
             self.current_segment_index += 1
             if self.current_segment_index >= self.total_segments:
                 self.trajectory_active = False
@@ -317,12 +526,17 @@ class TrajectoryPlanner(Node):
                 )
                 return
 
-            if self.segment_wait_duration > 0.0:
+            self.current_wait_duration = (
+                self._get_wait_duration_after_segment(
+                    completed_segment_index
+                )
+            )
+            if self.current_wait_duration > 0.0:
                 self.waiting_between_segments = True
                 self.segment_wait_start_time = now
                 self.get_logger().info(
                     f'❄️  保持 {self.current_segment_end:.2f}°，'
-                    f'冷却等待 {self.segment_wait_duration:.2f}s'
+                    f'等待 {self.current_wait_duration:.2f}s'
                 )
             else:
                 self._start_current_segment()
@@ -338,7 +552,9 @@ class TrajectoryPlanner(Node):
 
         # 每 10 帧打印一次进度
         if self.segment_frame_count % 10 == 0:
-            progress = (elapsed / self.duration) * 100.0
+            progress = (
+                elapsed / self.current_segment_duration
+            ) * 100.0
             self.get_logger().info(
                 f'📤 第 {self.current_segment_index + 1} 段 '
                 f'帧 #{self.segment_frame_count} | '
